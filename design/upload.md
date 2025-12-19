@@ -1,5 +1,7 @@
 # JA Manifest v2 Upload Design
 
+> **Note:** This document contains the original prototype design. The production implementation is now in `storage-design.md` which provides a platform-agnostic storage abstraction with CRT and WASM backends.
+
 ## Overview
 
 Functional prototype for uploading input files to S3 Content-Addressable Storage (CAS) with support for the v2 manifest format's chunking feature.

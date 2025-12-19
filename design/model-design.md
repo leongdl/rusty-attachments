@@ -17,33 +17,43 @@ This document outlines the design for a Rust implementation of the Job Attachmen
 rusty-attachments/
 ├── Cargo.toml                    # Workspace root
 ├── design/
-│   └── model-design.md           # This document
+│   ├── model-design.md           # This document
+│   ├── storage-design.md         # Storage abstraction design
+│   └── upload.md                 # Original upload prototype
 ├── crates/
-│   ├── model/                    # Core manifest model
+│   ├── model/                    # Core manifest model ✅ IMPLEMENTED
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── lib.rs
 │   │       ├── version.rs        # ManifestVersion, ManifestType enums
 │   │       ├── hash.rs           # HashAlgorithm enum
-│   │       ├── path.rs           # ManifestPath trait + implementations
-│   │       ├── manifest.rs       # AssetManifest trait + implementations
+│   │       ├── manifest.rs       # Manifest enum wrapper
 │   │       ├── v2023_03_03.rs    # v1 format implementation
 │   │       ├── v2025_12_04.rs    # v2 format implementation
 │   │       ├── encode.rs         # Canonical JSON encoding
 │   │       ├── decode.rs         # JSON decoding with validation
 │   │       └── error.rs          # Error types
 │   │
-│   ├── python/                   # PyO3 bindings
+│   ├── storage/                  # Storage abstraction ✅ IMPLEMENTED
+│   │   ├── Cargo.toml
+│   │   └── src/
+│   │       ├── lib.rs
+│   │       ├── types.rs          # Shared data structures
+│   │       ├── traits.rs         # StorageClient trait
+│   │       ├── cas.rs            # CAS key generation, chunking logic
+│   │       └── error.rs          # Error types
+│   │
+│   ├── python/                   # PyO3 bindings (pending)
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       └── lib.rs
 │   │
-│   └── wasm/                     # WASM bindings
+│   └── wasm/                     # WASM bindings (pending)
 │       ├── Cargo.toml
 │       └── src/
 │           └── lib.rs
 │
-└── python/                       # Python package wrapper
+└── python/                       # Python package wrapper (pending)
     ├── pyproject.toml
     └── rusty_attachments/
         └── __init__.py
@@ -254,29 +264,29 @@ impl AssetManifest {
 
 ## Implementation Plan
 
-### Phase 1: Core Model (Week 1)
-- [ ] Set up Cargo workspace
-- [ ] Implement enums (version, hash algorithm, manifest type)
-- [ ] Implement v2023-03-03 structs with serde
-- [ ] Implement v2025-12-04-beta structs with serde
-- [ ] Add validation logic
-- [ ] Unit tests for serialization/deserialization
+### Phase 1: Core Model ✅ COMPLETE
+- [x] Set up Cargo workspace
+- [x] Implement enums (version, hash algorithm, manifest type)
+- [x] Implement v2023-03-03 structs with serde
+- [x] Implement v2025-12-04-beta structs with serde
+- [x] Add validation logic
+- [x] Unit tests for serialization/deserialization
 
-### Phase 2: Encoding/Decoding (Week 2)
-- [ ] Implement canonical JSON encoding for v1
-- [ ] Implement directory index compression for v2
-- [ ] Implement decode with version detection
-- [ ] Add validation during decode
-- [ ] Roundtrip tests
+### Phase 2: Encoding/Decoding ✅ COMPLETE
+- [x] Implement canonical JSON encoding for v1
+- [x] Implement directory index compression for v2
+- [x] Implement decode with version detection
+- [x] Add validation during decode
+- [x] Roundtrip tests
 
-### Phase 3: Python Bindings (Week 3)
+### Phase 3: Python Bindings (Pending)
 - [ ] Set up PyO3 crate
 - [ ] Expose Manifest enum to Python
 - [ ] Expose encode/decode functions
 - [ ] Python type stubs (.pyi files)
 - [ ] Integration tests with existing Python code
 
-### Phase 4: WASM Bindings (Week 4)
+### Phase 4: WASM Bindings (Pending)
 - [ ] Set up wasm-bindgen crate
 - [ ] Expose to JavaScript/TypeScript
 - [ ] Build and publish npm package
@@ -316,6 +326,13 @@ rusty-attachments-model = { path = "../model" }
 
 ## Open Questions
 
-1. Should we support streaming decode for very large manifests?
-2. Do we need async support for the bindings?
-3. Should validation be opt-in or always-on during decode?
+1. ~~Should we support streaming decode for very large manifests?~~ **Resolved:** Chunking is sufficient, no streaming needed.
+2. ~~Do we need async support for the bindings?~~ **Resolved:** Yes, storage operations use async. Model crate remains sync.
+3. ~~Should validation be opt-in or always-on during decode?~~ **Resolved:** Validation is always-on during decode.
+
+---
+
+## Related Documents
+
+- [storage-design.md](storage-design.md) - Storage abstraction for S3 operations (upload/download)
+- [upload.md](upload.md) - Original upload prototype (superseded by storage-design.md)

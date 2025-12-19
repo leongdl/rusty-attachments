@@ -1191,3 +1191,31 @@ AWS credentials are passed via `StorageSettings.credentials`. If `None`, the bac
 ## Open Questions
 
 1. **Cancellation:** How do we propagate cancellation from progress callbacks through async operations? Need to design a clean cancellation token pattern that works across Rust async, WASM/JS Promises, and Python.
+
+---
+
+## Future Work (TODO)
+
+### Business Logic
+- [ ] Implement business logic to upload files from a manifest
+- [ ] Implement logic to upload the manifest file itself to S3
+- [ ] Implement business logic to download files from a manifest
+
+### File/Folder Operations
+- [ ] File folder scanning - walk directory tree, collect file metadata
+- [ ] Manifest utilities:
+  - [ ] Snapshot folder - create manifest from directory
+  - [ ] Diff manifest - compute changes between two manifests
+  - [ ] Diff a folder - compare folder state to existing manifest
+  - [ ] Merge manifests - combine multiple manifests with proper time ordering
+
+### Testing & Edge Cases
+- [ ] Fuzz testing with weird file paths (unicode, special chars, long paths)
+- [ ] Edge cases for manifest merging (time ordering, conflict resolution)
+- [ ] Compatibility testing with Python manifest file naming conventions
+- [ ] S3 object tags for manifests (metadata, versioning)
+
+### Python Compatibility
+- [ ] Ensure manifest file names match Python implementation format
+- [ ] Verify hash output matches Python xxhash implementation
+- [ ] Test roundtrip: Python create → Rust read → Python read
