@@ -1,10 +1,10 @@
 Add a todo in the design
 
-- Implement business logic to upload a manifest
+- Implement business logic to upload a manifest (Doc need implement)
 
-- Implement logic to upload the manifest file
+- Implement logic to upload the manifest file (Doc need implement)
 
-- File folder scanning snapshot folder, diff a folder
+- File folder scanning snapshot folder, diff a folder (Doc, need implement)
 
 - Manifest utilities, diff manifest, merge manifest
 

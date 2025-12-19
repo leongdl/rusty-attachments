@@ -45,6 +45,71 @@ The timestamp format is ISO 8601: `YYYY-MM-DDTHH:MM:SS.ffffffZ` (e.g., `2025-05-
 
 ---
 
+## S3 Metadata
+
+Manifests are uploaded with S3 user metadata to track the asset root and optional file system location.
+
+### Metadata Fields
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `asset-root` | Yes* | The root path the manifest was created from (ASCII paths only) |
+| `asset-root-json` | Yes* | JSON-encoded root path (for non-ASCII paths, or as fallback) |
+| `file-system-location-name` | No | File system location name for storage profile mapping |
+
+*One of `asset-root` or `asset-root-json` is required. For backward compatibility, when the path contains non-ASCII characters, both fields are populated with the JSON-encoded value.
+
+### Metadata Structure
+
+```rust
+/// S3 metadata attached to manifest uploads
+#[derive(Debug, Clone, Default)]
+pub struct ManifestS3Metadata {
+    /// Root path the manifest was created from
+    pub asset_root: String,
+    
+    /// Optional file system location name (for storage profile mapping)
+    pub file_system_location_name: Option<String>,
+}
+
+impl ManifestS3Metadata {
+    /// Build S3 metadata headers for upload
+    pub fn to_s3_metadata(&self) -> HashMap<String, String> {
+        let mut metadata = HashMap::new();
+        
+        // Handle non-ASCII paths with JSON encoding
+        if self.asset_root.is_ascii() {
+            metadata.insert("asset-root".into(), self.asset_root.clone());
+        } else {
+            // For non-ASCII paths, populate both fields for backward compatibility
+            let json_encoded = serde_json::to_string(&self.asset_root).unwrap();
+            metadata.insert("asset-root".into(), json_encoded.clone());
+            metadata.insert("asset-root-json".into(), json_encoded);
+        }
+        
+        if let Some(ref location) = self.file_system_location_name {
+            metadata.insert("file-system-location-name".into(), location.clone());
+        }
+        
+        metadata
+    }
+    
+    /// Parse S3 metadata from download response
+    pub fn from_s3_metadata(metadata: &HashMap<String, String>) -> Option<Self> {
+        // Prefer asset-root-json for non-ASCII paths
+        let asset_root = metadata.get("asset-root-json")
+            .and_then(|v| serde_json::from_str(v).ok())
+            .or_else(|| metadata.get("asset-root").cloned())?;
+        
+        let file_system_location_name = metadata.get("file-system-location-name").cloned();
+        
+        Some(Self { asset_root, file_system_location_name })
+    }
+}
+```
+
+---
+
 ## Data Structures
 
 ```rust
@@ -76,13 +141,15 @@ pub struct StepOutputManifestPath {
     pub timestamp: f64,  // Seconds since epoch, converted to ISO 8601
 }
 
-/// Metadata attached to manifest in S3
+/// Metadata returned when downloading a manifest
 #[derive(Debug, Clone)]
-pub struct ManifestMetadata {
+pub struct ManifestDownloadMetadata {
     /// Root path the manifest was created from
     pub asset_root: String,
-    /// Content type based on manifest version and type
-    pub content_type: String,
+    /// Optional file system location name
+    pub file_system_location_name: Option<String>,
+    /// Content type from S3
+    pub content_type: Option<String>,
 }
 
 /// Result of uploading a manifest
@@ -90,15 +157,6 @@ pub struct ManifestMetadata {
 pub struct ManifestUploadResult {
     pub s3_key: String,
     pub manifest_hash: String,
-}
-
-/// Info about a manifest found in S3
-#[derive(Debug, Clone)]
-pub struct ManifestInfo {
-    pub s3_key: String,
-    pub manifest_hash: String,
-    pub last_modified: i64,
-    pub asset_root: Option<String>,
 }
 ```
 
@@ -118,6 +176,7 @@ pub async fn upload_input_manifest(
     location: &ManifestLocation,
     manifest: &Manifest,
     asset_root: &str,
+    file_system_location_name: Option<&str>,
 ) -> Result<ManifestUploadResult, StorageError>;
 
 /// Upload an output manifest to S3 (task-level)
@@ -129,6 +188,7 @@ pub async fn upload_task_output_manifest(
     output_path: &TaskOutputManifestPath,
     manifest: &Manifest,
     asset_root: &str,
+    file_system_location_name: Option<&str>,
 ) -> Result<ManifestUploadResult, StorageError>;
 
 /// Upload an output manifest to S3 (step-level, no task)
@@ -140,6 +200,7 @@ pub async fn upload_step_output_manifest(
     output_path: &StepOutputManifestPath,
     manifest: &Manifest,
     asset_root: &str,
+    file_system_location_name: Option<&str>,
 ) -> Result<ManifestUploadResult, StorageError>;
 ```
 
@@ -151,55 +212,14 @@ pub async fn download_manifest(
     client: &impl StorageClient,
     bucket: &str,
     s3_key: &str,
-) -> Result<(Manifest, ManifestMetadata), StorageError>;
+) -> Result<(Manifest, ManifestDownloadMetadata), StorageError>;
 
 /// Download a manifest by its hash (input manifest)
 pub async fn download_input_manifest(
     client: &impl StorageClient,
     location: &ManifestLocation,
     manifest_hash: &str,
-) -> Result<(Manifest, ManifestMetadata), StorageError>;
-```
-
-### List Functions
-
-```rust
-/// List all input manifests for a queue
-pub async fn list_input_manifests(
-    client: &impl StorageClient,
-    location: &ManifestLocation,
-) -> Result<Vec<ManifestInfo>, StorageError>;
-
-/// List output manifests for a job/step/task
-///
-/// Returns manifests sorted by timestamp (most recent first).
-/// For retried tasks, only the latest manifest per session is typically needed.
-///
-/// If task_id is None, searches at step level first, then falls back to task level.
-pub async fn list_output_manifests(
-    client: &impl StorageClient,
-    location: &ManifestLocation,
-    job_id: &str,
-    step_id: &str,
-    task_id: Option<&str>,
-) -> Result<Vec<ManifestInfo>, StorageError>;
-
-/// List output manifests at task level only
-pub async fn list_task_output_manifests(
-    client: &impl StorageClient,
-    location: &ManifestLocation,
-    job_id: &str,
-    step_id: &str,
-    task_id: &str,
-) -> Result<Vec<ManifestInfo>, StorageError>;
-
-/// List output manifests at step level only (no task)
-pub async fn list_step_output_manifests(
-    client: &impl StorageClient,
-    location: &ManifestLocation,
-    job_id: &str,
-    step_id: &str,
-) -> Result<Vec<ManifestInfo>, StorageError>;
+) -> Result<(Manifest, ManifestDownloadMetadata), StorageError>;
 ```
 
 ---
@@ -231,27 +251,7 @@ fn get_content_type(manifest: &Manifest) -> &'static str {
 
 ## S3 Metadata Handling
 
-```rust
-/// Build S3 metadata for manifest upload
-fn build_manifest_metadata(asset_root: &str) -> HashMap<String, String> {
-    let mut metadata = HashMap::new();
-    
-    // Handle non-ASCII paths with JSON encoding
-    match asset_root.is_ascii() {
-        true => metadata.insert("asset-root".into(), asset_root.into()),
-        false => metadata.insert("asset-root-json".into(), serde_json::to_string(asset_root).unwrap()),
-    };
-    
-    metadata
-}
-
-/// Extract asset root from S3 metadata
-fn extract_asset_root(metadata: &HashMap<String, String>) -> Option<String> {
-    metadata.get("asset-root-json")
-        .and_then(|v| serde_json::from_str(v).ok())
-        .or_else(|| metadata.get("asset-root").cloned())
-}
-```
+See the [S3 Metadata](#s3-metadata) section above for the `ManifestS3Metadata` struct that handles building and parsing S3 metadata.
 
 ---
 
@@ -259,7 +259,7 @@ fn extract_asset_root(metadata: &HashMap<String, String>) -> Option<String> {
 
 ```rust
 use rusty_attachments_storage::{
-    upload_input_manifest, download_manifest, list_output_manifests,
+    upload_input_manifest, download_manifest,
     ManifestLocation, CrtStorageClient,
 };
 
@@ -272,17 +272,18 @@ let location = ManifestLocation {
 };
 
 // Upload input manifest
-let result = upload_input_manifest(&client, &location, &manifest, "/project/assets").await?;
+let result = upload_input_manifest(
+    &client,
+    &location,
+    &manifest,
+    "/project/assets",
+    None,  // file_system_location_name
+).await?;
 println!("Uploaded: {} (hash: {})", result.s3_key, result.manifest_hash);
 
-// List output manifests for a step
-let outputs = list_output_manifests(&client, &location, "job-789", Some("step-abc"), None).await?;
-for info in outputs {
-    println!("{} (modified: {})", info.s3_key, info.last_modified);
-}
-
 // Download manifest
-let (manifest, metadata) = download_manifest(&client, &location.bucket, &outputs[0].s3_key).await?;
+let (manifest, metadata) = download_manifest(&client, &location.bucket, &result.s3_key).await?;
+println!("Asset root: {}", metadata.asset_root);
 ```
 
 ---
