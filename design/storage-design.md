@@ -2,11 +2,10 @@
 
 ## Overview
 
-This document outlines the design for a platform-agnostic storage abstraction layer that enables upload and download operations to S3 Content-Addressable Storage (CAS). The design supports multiple backend implementations:
+This document outlines the design for a platform-agnostic storage abstraction layer that enables upload and download operations to S3 Content-Addressable Storage (CAS). The design supports two backend implementations:
 
-1. **Rust/CRT** - Native Rust using AWS CRT for high-performance operations
+1. **Rust/CRT** - Native Rust using AWS CRT for high-performance operations (also used by Python via PyO3 bindings)
 2. **WASM/JS SDK** - WebAssembly using AWS SDK for JavaScript v3
-3. **Python/boto3** - Python bindings using boto3 with CRT acceleration
 
 ## Goals
 
@@ -32,12 +31,13 @@ This document outlines the design for a platform-agnostic storage abstraction la
 │                     (Traits: StorageClient, etc.)                           │
 └─────────────────────────────────────────────────────────────────────────────┘
                                     │
-            ┌───────────────────────┼───────────────────────┐
-            ▼                       ▼                       ▼
-┌───────────────────┐   ┌───────────────────┐   ┌───────────────────┐
-│   CRT Backend     │   │   JS SDK Backend  │   │  Python Backend   │
-│   (Rust Native)   │   │   (WASM/JS)       │   │  (PyO3/boto3)     │
-└───────────────────┘   └───────────────────┘   └───────────────────┘
+                    ┌───────────────┴───────────────┐
+                    ▼                               ▼
+        ┌───────────────────┐           ┌───────────────────┐
+        │   CRT Backend     │           │   JS SDK Backend  │
+        │   (Rust Native)   │           │   (WASM/JS)       │
+        │   + Python/PyO3   │           └───────────────────┘
+        └───────────────────┘
 ```
 
 ---
@@ -66,17 +66,16 @@ rusty-attachments/
 │   │       ├── lib.rs
 │   │       └── client.rs         # CRT-based StorageClient
 │   │
-│   ├── python/                   # Existing - PyO3 bindings
+│   ├── python/                   # Existing - PyO3 bindings (uses CRT backend)
 │   │   └── src/
-│   │       └── storage.rs        # Python storage bindings (uses callback to boto3)
+│   │       └── lib.rs
 │   │
 │   └── wasm/                     # Existing - WASM bindings
 │       └── src/
 │           └── storage.rs        # WASM storage bindings (calls JS SDK)
 │
 └── design/
-    └── storage/
-        └── storage-design.md     # This document
+    └── storage-design.md         # This document
 ```
 
 ---
@@ -582,12 +581,13 @@ pub enum DownloadStrategy {
 
 ## Backend Implementations
 
-### CRT Backend (Rust Native)
+### CRT Backend (Rust Native + Python)
 
 ```rust
 // crates/storage-crt/src/client.rs
 
 /// StorageClient implementation using AWS CRT
+/// Used directly by Rust applications and exposed to Python via PyO3
 pub struct CrtStorageClient {
     s3_client: aws_crt_s3::Client,
     // ... configuration
@@ -649,46 +649,6 @@ export async function js_head_object(bucket: string, key: string): Promise<numbe
 // ... similar wrappers for other operations
 ```
 
-### Python Backend
-
-For Python, we use PyO3 to accept Python callables:
-
-```rust
-// crates/python/src/storage.rs
-
-/// StorageClient implementation that delegates to Python/boto3
-#[pyclass]
-pub struct PyStorageClient {
-    // Python callable objects for each operation
-    head_object_fn: PyObject,
-    put_object_fn: PyObject,
-    get_object_fn: PyObject,
-    // ... etc
-}
-
-impl StorageClient for PyStorageClient {
-    // Implement trait methods by calling Python functions
-    // Use pyo3-asyncio for async interop
-}
-```
-
-Python side:
-
-```python
-# Example boto3 wrapper that Rust calls into
-import boto3
-from typing import Optional
-
-s3_client = boto3.client('s3')
-
-def head_object(bucket: str, key: str) -> Optional[int]:
-    try:
-        response = s3_client.head_object(Bucket=bucket, Key=key)
-        return response['ContentLength']
-    except s3_client.exceptions.NoSuchKey:
-        return None
-```
-
 ---
 
 ## Usage Examples
@@ -726,14 +686,13 @@ const orchestrator = new UploadOrchestrator(client, location);
 const stats = await orchestrator.uploadManifest(manifest, '/local/root', progressCallback);
 ```
 
-### Python (boto3 Backend)
+### Python (via CRT Backend)
 
 ```python
-from rusty_attachments import UploadOrchestrator, S3Location, PyStorageClient
-import boto3
+from rusty_attachments import UploadOrchestrator, S3Location, CrtStorageClient
 
-s3_client = boto3.client('s3')
-storage_client = PyStorageClient.from_boto3(s3_client)
+# CRT client handles credentials via standard AWS credential chain
+storage_client = CrtStorageClient(region="us-west-2")
 
 location = S3Location(
     bucket="my-bucket",
@@ -778,10 +737,9 @@ stats = orchestrator.upload_manifest(manifest, "/local/root", progress_callback)
 - [ ] Create TypeScript type definitions
 - [ ] Browser tests
 
-### Phase 6: Python Backend
-- [ ] Add storage bindings to `python` crate
-- [ ] Implement `PyStorageClient`
-- [ ] Integration tests with boto3
+### Phase 6: Python Bindings
+- [ ] Expose CRT backend to Python via PyO3
+- [ ] Integration tests from Python
 
 ---
 
