@@ -1174,6 +1174,99 @@ Chunking is sufficient for large files - no streaming needed. The 256MB chunk si
 - Efficient partial file updates (only changed chunks re-uploaded)
 - Reasonable memory footprint (one chunk in memory at a time)
 
+### Small vs Large File Upload Strategy
+
+Files are separated into two queues for optimal upload performance:
+
+```rust
+/// Default threshold for small vs large file classification.
+/// Small files benefit from parallel object uploads.
+/// Large files benefit from serial processing with parallel multipart.
+pub const SMALL_FILE_THRESHOLD: u64 = 8 * 1024 * 1024 * 10; // 80MB default
+
+/// Separate files into small and large queues.
+pub fn separate_files_by_size<'a>(
+    files: &'a [impl ManifestEntry],
+    threshold: u64,
+) -> (Vec<&'a impl ManifestEntry>, Vec<&'a impl ManifestEntry>) {
+    let mut small_queue = Vec::new();
+    let mut large_queue = Vec::new();
+    
+    for file in files {
+        if file.size() <= threshold {
+            small_queue.push(file);
+        } else {
+            large_queue.push(file);
+        }
+    }
+    
+    (small_queue, large_queue)
+}
+```
+
+Upload strategy:
+1. **Small files**: Upload in parallel using a thread pool (e.g., 10 concurrent uploads)
+2. **Large files**: Upload serially, but each file uses parallel multipart internally
+
+This prevents bandwidth waste if uploads are cancelled mid-way through multiple large files.
+
+### Cancellation Support
+
+Operations support cancellation via the `ProgressCallback` return value:
+
+```rust
+/// Callback trait for progress reporting with cancellation.
+pub trait ProgressCallback: Send + Sync {
+    /// Called with progress updates.
+    /// Returns `true` to continue, `false` to cancel the operation.
+    fn on_progress(&self, progress: &TransferProgress) -> bool;
+}
+
+/// Error returned when operation is cancelled.
+#[derive(Debug, Clone)]
+pub struct CancelledError {
+    /// Statistics at the time of cancellation.
+    pub partial_stats: TransferStatistics,
+    /// Message describing what was cancelled.
+    pub message: String,
+}
+```
+
+Cancellation flow:
+1. Progress callback returns `false`
+2. Current operation completes (or is aborted if backend supports it)
+3. `StorageError::Cancelled` is returned with partial statistics
+4. Caller can inspect `partial_stats` to see what was completed
+
+```rust
+impl<C: StorageClient> UploadOrchestrator<C> {
+    async fn upload_with_cancellation(
+        &self,
+        files: &[ManifestEntry],
+        progress: Option<&dyn ProgressCallback>,
+    ) -> Result<TransferStatistics, StorageError> {
+        let mut stats = TransferStatistics::default();
+        
+        for file in files {
+            // Check for cancellation before each file
+            if let Some(cb) = progress {
+                if !cb.on_progress(&TransferProgress::checking(&file.path)) {
+                    return Err(StorageError::Cancelled {
+                        partial_stats: stats,
+                        message: "Upload cancelled by user".into(),
+                    });
+                }
+            }
+            
+            let result = self.upload_file(file, progress).await?;
+            stats.merge(result);
+        }
+        
+        Ok(stats)
+    }
+}
+```
+
 ### Retry Policy
 
 Retry logic is implemented in the `StorageClient` trait implementations (not the orchestrator), with configurable settings via `StorageSettings`:
@@ -1186,11 +1279,9 @@ This keeps the orchestrator focused on business logic while backends handle tran
 
 AWS credentials are passed via `StorageSettings.credentials`. If `None`, the backend uses the default AWS credential chain (environment variables, config files, IAM roles, etc.).
 
----
+### CAS Data Files
 
-## Open Questions
-
-1. **Cancellation:** How do we propagate cancellation from progress callbacks through async operations? Need to design a clean cancellation token pattern that works across Rust async, WASM/JS Promises, and Python.
+CAS data files (the actual file content) are uploaded without special headers - they are raw binary uploads keyed by their content hash. Only manifests have metadata headers (see [manifest-storage.md](manifest-storage.md)).
 
 ---
 
@@ -1209,6 +1300,9 @@ AWS credentials are passed via `StorageSettings.credentials`. If `None`, the bac
   - [ ] Diff a folder - compare folder state to existing manifest
   - [ ] Merge manifests - combine multiple manifests with proper time ordering
 
+### CLI Features
+- [ ] **Snapshot mode**: Copy files to a local directory structure matching S3 layout instead of uploading. Useful for offline testing, debugging, and creating portable job bundles.
+
 ### Testing & Edge Cases
 - [ ] Fuzz testing with weird file paths (unicode, special chars, long paths)
 - [ ] Edge cases for manifest merging (time ordering, conflict resolution)
@@ -1219,3 +1313,12 @@ AWS credentials are passed via `StorageSettings.credentials`. If `None`, the bac
 - [ ] Ensure manifest file names match Python implementation format
 - [ ] Verify hash output matches Python xxhash implementation
 - [ ] Test roundtrip: Python create → Rust read → Python read
+
+---
+
+## Related Documents
+
+- [hash-cache.md](hash-cache.md) - Hash cache and S3 check cache designs
+- [manifest-storage.md](manifest-storage.md) - Manifest upload/download with metadata
+- [storage-profiles.md](storage-profiles.md) - Storage profiles and file system locations
+- [job-submission.md](job-submission.md) - Converting manifests to job submission format

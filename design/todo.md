@@ -1,20 +1,41 @@
-Add a todo in the design
+# Rusty Attachments: TODO
 
-- Implement business logic to upload a manifest (Doc need implement)
+## Design Documents Completed
+- [x] Model design (manifest structures)
+- [x] Storage design (upload/download orchestration)
+- [x] Manifest storage (S3 manifest upload/download with metadata)
+- [x] File system (snapshot/diff operations)
+- [x] Hash cache (local file hash caching)
+- [x] S3 check cache (S3 existence caching)
+- [x] Storage profiles (file system locations)
+- [x] Job submission (manifest to job attachments conversion)
+- [x] Manifest utilities (diff/merge operations)
 
-- Implement logic to upload the manifest file (Doc need implement)
+## Implementation TODO
 
-- File folder scanning snapshot folder, diff a folder (Doc, need implement)
+### Core
+- [ ] Implement business logic to upload a manifest
+- [ ] Implement logic to upload the manifest file
+- [ ] File folder scanning, snapshot folder, diff a folder
+- [ ] Manifest utilities: diff manifest, merge manifest
 
-- Manifest utilities, diff manifest, merge manifest (Doc, need implement)
+### Caches
+- [ ] Hash cache SQLite backend
+- [ ] S3 check cache SQLite backend
+- [ ] Cache integrity verification
 
-- Fuzz testing with weird file paths
+### Testing
+- [ ] Fuzz testing with weird file paths (unicode, special chars, long paths)
+- [ ] Edge cases: merging manifests with time ordering
+- [ ] Compatibility with Python manifest file names
+- [ ] Roundtrip tests: Python create → Rust read → Python read
 
-- Edge cases like merging manifest must take care of time
+### Features
+- [ ] S3 object tags for manifests
+- [ ] Path mapping utilities
+- [ ] Storage profile utilities
+- [ ] CLI snapshot mode (local copy instead of S3 upload)
 
-- Compatibility with python file names for manifest 
-
-- S3 object tags for manifests
-
-- Path Mapping utilities
-- Storage Profile utilities
+### Bindings
+- [ ] Python bindings (PyO3)
+- [ ] WASM bindings
