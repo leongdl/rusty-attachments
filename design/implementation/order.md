@@ -13,25 +13,25 @@ This document outlines the implementation order to build the `submit_bundle_atta
 
 ## Phase 2: Common Utilities
 
-**Crate:** `common`
+**Crate:** `common` ✅ COMPLETE
 
 Shared utilities referenced by all other crates.
 
-- [ ] Path utilities
+- [x] Path utilities
   - `to_absolute()`
   - `lexical_normalize()`
   - `normalize_for_manifest()`
   - `to_posix_path()`
   - `from_posix_path()`
-- [ ] Hash utilities
+- [x] Hash utilities
   - `hash_file()`
   - `hash_bytes()`
-- [ ] Constants
+- [x] Constants
   - `CHUNK_SIZE_V2`
   - `DEFAULT_HASH_CACHE_TTL_DAYS`
   - `DEFAULT_STAT_CACHE_CAPACITY`
-- [ ] `ProgressCallback<T>` trait
-- [ ] `get_machine_id()` - Platform-specific machine identifier
+- [x] `ProgressCallback<T>` trait
+- [x] `get_machine_id()` - Platform-specific machine identifier
 
 ---
 

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/common",
     "crates/model",
     "crates/storage",
     "crates/python",
@@ -18,4 +19,5 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "1.0"
 async-trait = "0.1"
+rusty-attachments-common = { path = "crates/common" }
 rusty-attachments-model = { path = "crates/model" }
