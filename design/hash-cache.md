@@ -6,6 +6,20 @@ Computing XXH128 hashes for large files is expensive. This document proposes a h
 
 ---
 
+## Dependencies
+
+This module uses utilities from the `common` crate:
+
+```rust
+use rusty_attachments_common::{
+    hash_file, hash_bytes, 
+    DEFAULT_HASH_CACHE_TTL_DAYS,
+    HashAlgorithm,
+};
+```
+
+---
+
 ## Project Structure
 
 ```
@@ -107,6 +121,8 @@ pub trait HashCacheBackend: Send + Sync {
 ## High-Level Wrapper
 
 ```rust
+use rusty_attachments_common::DEFAULT_HASH_CACHE_TTL_DAYS;
+
 /// Hash cache with configurable backend and TTL.
 pub struct HashCache {
     backend: Box<dyn HashCacheBackend>,
@@ -122,6 +138,11 @@ impl HashCache {
             ttl_days,
             hash_alg: HashAlgorithm::Xxh128,
         }
+    }
+    
+    /// Create with default TTL from common constants.
+    pub fn with_default_ttl(backend: impl HashCacheBackend + 'static) -> Self {
+        Self::new(backend, DEFAULT_HASH_CACHE_TTL_DAYS)
     }
 
     /// Look up a cached hash. Returns None if not cached or expired.
@@ -244,17 +265,19 @@ DynamoDB's native TTL handles expiration automatically.
 
 ```rust
 use rusty_attachments_storage::hash_cache::{HashCache, SqliteHashCache};
+use rusty_attachments_common::hash_file;
 
 // Local cache (submitter or worker)
 let sqlite = SqliteHashCache::open(&cache_path, machine_id).await?;
-let cache = HashCache::new(sqlite, 30); // 30-day TTL
+let cache = HashCache::with_default_ttl(sqlite);
 
 // Usage in manifest creation
 for file in files {
     let hash = match cache.get(&file.path, file.size, file.mtime).await {
         Some(h) => h,
         None => {
-            let h = compute_xxh128(&file.full_path).await?;
+            // Use hash_file from common crate
+            let h = hash_file(&file.full_path, HashAlgorithm::Xxh128)?;
             cache.put(&file.path, file.size, file.mtime, h.clone()).await;
             h
         }
@@ -523,6 +546,7 @@ for file in manifest.files() {
 
 ## Related Documents
 
+- [common.md](common.md) - Shared hash utilities and constants
 - [model-design.md](model-design.md) - ManifestFilePath with path/size/mtime fields
 - [file_system.md](file_system.md) - Manifest creation from directories
 - [storage-design.md](storage-design.md) - Upload orchestration using both caches

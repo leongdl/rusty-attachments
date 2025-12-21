@@ -83,13 +83,15 @@ rusty-attachments/
 
 ### Constants
 
-```rust
-/// Chunk size for manifest v2 format (256MB)
-/// Files larger than this are split into chunks with individual hashes
-pub const CHUNK_SIZE_V2: u64 = 256 * 1024 * 1024; // 268435456 bytes
+Constants are defined in the `common` crate and re-exported here for convenience:
 
-/// No chunking (for v1 format or when chunking is disabled)
-pub const CHUNK_SIZE_NONE: u64 = 0;
+```rust
+// Re-exported from rusty_attachments_common::constants
+pub use rusty_attachments_common::{
+    CHUNK_SIZE_V2,           // 256MB - chunk size for v2 format
+    CHUNK_SIZE_NONE,         // 0 - no chunking
+    SMALL_FILE_THRESHOLD,    // 80MB - small vs large file threshold
+};
 ```
 
 ### Storage Settings
@@ -283,7 +285,11 @@ pub struct TransferStatistics {
 
 ### Progress Reporting
 
+Progress reporting uses the generic `ProgressCallback<T>` trait from the `common` crate:
+
 ```rust
+use rusty_attachments_common::ProgressCallback;
+
 /// Progress update for transfer operations
 #[derive(Debug, Clone)]
 pub struct TransferProgress {
@@ -357,12 +363,9 @@ pub struct SummaryStatistics {
     pub status: ProgressStatus,
 }
 
-/// Callback trait for progress reporting
-pub trait ProgressCallback: Send + Sync {
-    /// Called with progress updates
-    /// Returns false to cancel the operation
-    fn on_progress(&self, progress: &TransferProgress) -> bool;
-}
+/// Type alias for transfer progress callbacks.
+/// Uses the generic ProgressCallback<T> from common crate.
+pub type TransferProgressCallback = dyn ProgressCallback<TransferProgress>;
 ```
 
 ### Error Types
@@ -1382,12 +1385,10 @@ This prevents bandwidth waste if uploads are cancelled mid-way through multiple 
 Operations support cancellation via the `ProgressCallback` return value:
 
 ```rust
-/// Callback trait for progress reporting with cancellation.
-pub trait ProgressCallback: Send + Sync {
-    /// Called with progress updates.
-    /// Returns `true` to continue, `false` to cancel the operation.
-    fn on_progress(&self, progress: &TransferProgress) -> bool;
-}
+use rusty_attachments_common::ProgressCallback;
+
+// The generic ProgressCallback<T> from common returns false to cancel
+// See common.md for the trait definition
 
 /// Error returned when operation is cancelled.
 #[derive(Debug, Clone)]
@@ -1485,6 +1486,7 @@ CAS data files (the actual file content) are uploaded without special headers - 
 
 ## Related Documents
 
+- [common.md](common.md) - Shared constants, hash utilities, progress callback
 - [hash-cache.md](hash-cache.md) - Hash cache and S3 check cache designs
 - [manifest-storage.md](manifest-storage.md) - Manifest upload/download with metadata
 - [storage-profiles.md](storage-profiles.md) - Storage profiles and file system locations

@@ -11,6 +11,16 @@ This design enables:
 
 ---
 
+## Dependencies
+
+This module uses path utilities from the `common` crate:
+
+```rust
+use rusty_attachments_common::{lexical_normalize, to_absolute, PathError};
+```
+
+---
+
 ## Data Structures
 
 ### File System Location Type
@@ -383,17 +393,11 @@ pub fn group_asset_paths_validated(
 }
 
 /// Normalize a path: absolute without resolving symlinks, with .. removed.
+/// Uses utilities from common crate.
 fn normalize_path(path: &Path) -> PathBuf {
-    // Use absolute() not canonicalize() to preserve symlinks
-    let abs = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map(|cwd| cwd.join(path))
-            .unwrap_or_else(|_| path.to_path_buf())
-    };
+    use rusty_attachments_common::{to_absolute, lexical_normalize};
     
-    // Lexically normalize to remove . and ..
+    let abs = to_absolute(path).unwrap_or_else(|_| path.to_path_buf());
     lexical_normalize(&abs)
 }
 ```
@@ -436,5 +440,6 @@ When a storage profile is provided:
 
 ## Related Documents
 
+- [common.md](common.md) - Shared path utilities (`lexical_normalize`, `to_absolute`)
 - [file_system.md](file_system.md) - Snapshot and diff operations
 - [job-submission.md](job-submission.md) - Converting manifests to job attachments format

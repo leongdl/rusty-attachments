@@ -10,6 +10,19 @@ Path mapping enables translation between source paths (where files originated) a
 
 ---
 
+## Dependencies
+
+This module uses path utilities from the `common` crate:
+
+```rust
+use rusty_attachments_common::{
+    normalize_for_manifest, from_posix_path, to_posix_path,
+    hash_bytes, PathError,
+};
+```
+
+---
+
 ## Data Structures
 
 ### Path Format
@@ -237,36 +250,25 @@ pub fn get_local_destination(
 
 ## Path Transformation
 
+Path transformation utilities are provided by the `common` crate. The path-mapping module provides higher-level wrappers:
+
 ### Transform Manifest Path to Local Path
 
 ```rust
+use rusty_attachments_common::from_posix_path;
+
 /// Transform a relative path from a manifest to a local filesystem path.
 /// 
-/// Handles path separator conversion between Windows and POSIX formats.
+/// This is a convenience wrapper around `from_posix_path` from common.
 /// 
 /// # Arguments
 /// * `manifest_path` - Relative path from manifest (always uses `/` separators)
 /// * `local_root` - Local root directory
-/// * `source_format` - Original path format from manifest
 /// 
 /// # Returns
 /// Absolute local path
-pub fn manifest_path_to_local(
-    manifest_path: &str,
-    local_root: &Path,
-    source_format: PathFormat,
-) -> PathBuf {
-    // Manifest paths always use forward slashes
-    let components: Vec<&str> = manifest_path.split('/').collect();
-    
-    let mut result = local_root.to_path_buf();
-    for component in components {
-        if !component.is_empty() {
-            result.push(component);
-        }
-    }
-    
-    result
+pub fn manifest_path_to_local(manifest_path: &str, local_root: &Path) -> PathBuf {
+    from_posix_path(manifest_path, local_root)
 }
 
 /// Transform a local filesystem path to a manifest-relative path.
@@ -281,19 +283,17 @@ pub fn local_path_to_manifest(
     local_path: &Path,
     local_root: &Path,
 ) -> Result<String, PathMappingError> {
-    let relative = local_path
-        .strip_prefix(local_root)
-        .map_err(|_| PathMappingError::PathOutsideRoot {
-            path: local_path.display().to_string(),
-            root: local_root.display().to_string(),
-        })?;
+    use rusty_attachments_common::{normalize_for_manifest, PathError};
     
-    // Convert to forward slashes for manifest format
-    Ok(relative
-        .components()
-        .map(|c| c.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/"))
+    normalize_for_manifest(local_path, local_root)
+        .map_err(|e| match e {
+            PathError::PathOutsideRoot { path, root } => {
+                PathMappingError::PathOutsideRoot { path, root }
+            }
+            _ => PathMappingError::InvalidPath { 
+                path: local_path.display().to_string() 
+            },
+        })
 }
 ```
 
@@ -335,9 +335,17 @@ pub fn convert_output_dir_path(
 
 ## Error Types
 
+Path mapping errors extend the common `PathError`:
+
 ```rust
+use rusty_attachments_common::PathError;
+
 #[derive(Debug, thiserror::Error)]
 pub enum PathMappingError {
+    /// Path-related errors (from common crate)
+    #[error(transparent)]
+    Path(#[from] PathError),
+    
     #[error("No path mapping rule found for root path: {root_path}")]
     NoMappingFound { root_path: String },
     
@@ -428,6 +436,7 @@ rusty-attachments/
 
 ## Related Documents
 
+- [common.md](common.md) - Shared path utilities (`from_posix_path`, `normalize_for_manifest`)
 - [storage-profiles.md](storage-profiles.md) - Storage profile and file system location types
 - [job-submission.md](job-submission.md) - Converting manifests to job attachments format
 - [manifest-storage.md](manifest-storage.md) - Manifest upload/download operations

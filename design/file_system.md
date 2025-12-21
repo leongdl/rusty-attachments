@@ -21,6 +21,28 @@ Both operations support include/exclude glob patterns for filtering which files 
 
 ---
 
+## Dependencies
+
+This module depends on the `common` crate for shared utilities:
+
+```rust
+use rusty_attachments_common::{
+    // Constants
+    CHUNK_SIZE_V2, DEFAULT_STAT_CACHE_CAPACITY,
+    // Path utilities
+    normalize_for_manifest, lexical_normalize, to_posix_path, 
+    from_posix_path, is_within_root, to_long_path,
+    // Hash utilities
+    hash_file, hash_bytes, Xxh3Hasher,
+    // Progress callback
+    ProgressCallback,
+    // Error types
+    PathError,
+};
+```
+
+---
+
 ## Architecture
 
 ```
@@ -273,7 +295,11 @@ pub struct FileEntry {
 
 ### Progress Reporting
 
+Progress reporting uses the generic `ProgressCallback<T>` trait from the `common` crate:
+
 ```rust
+use rusty_attachments_common::ProgressCallback;
+
 /// Progress updates during file system operations
 #[derive(Debug, Clone)]
 pub struct ScanProgress {
@@ -310,12 +336,9 @@ pub enum ScanPhase {
     Complete,
 }
 
-/// Callback for progress reporting
-pub trait ProgressCallback: Send + Sync {
-    /// Called with progress updates
-    /// Returns false to cancel the operation
-    fn on_progress(&self, progress: &ScanProgress) -> bool;
-}
+/// Type alias for scan progress callbacks.
+/// Uses the generic ProgressCallback<T> from common crate.
+pub type ScanProgressCallback = dyn ProgressCallback<ScanProgress>;
 ```
 
 ---
@@ -705,9 +728,17 @@ let manifest = scanner.snapshot(&options, Some(&MyProgressReporter))?;
 
 ## Error Types
 
+File system errors extend the common `PathError` with filesystem-specific variants:
+
 ```rust
+use rusty_attachments_common::PathError;
+
 #[derive(Debug, thiserror::Error)]
 pub enum FileSystemError {
+    /// Path-related errors (from common crate)
+    #[error(transparent)]
+    Path(#[from] PathError),
+    
     #[error("Directory not found: {path}")]
     DirectoryNotFound { path: String },
     
@@ -726,18 +757,6 @@ pub enum FileSystemError {
     #[error("Symlink not allowed when opening file: {path}")]
     SymlinkNotAllowed { path: String },
     
-    #[error("Path is outside asset root: {path} not in {root}")]
-    PathOutsideRoot { path: String, root: String },
-    
-    #[error("Invalid path: {path}")]
-    InvalidPath { path: String },
-    
-    #[error("Path mismatch - expected {expected}, got {actual}")]
-    PathMismatch { expected: String, actual: String },
-    
-    #[error("Windows path verification failed for: {path}")]
-    WindowsPathVerificationFailed { path: String },
-    
     #[error("IO error at {path}: {source}")]
     IoError { path: String, source: std::io::Error },
     
@@ -749,6 +768,12 @@ pub enum FileSystemError {
     
     #[error("Manifest error: {message}")]
     ManifestError { message: String },
+    
+    #[error("Group not found: {group}")]
+    GroupNotFound { group: String },
+    
+    #[error("Too many file conflicts for: {path}")]
+    TooManyConflicts { path: String },
 }
 ```
 
@@ -799,87 +824,23 @@ pub trait HashCache: Send + Sync {
 
 ## Path Normalization
 
+Path normalization utilities are provided by the `common` crate. See [common.md](common.md) for details.
+
 All paths in manifests use POSIX-style forward slashes (`/`) regardless of the host OS. This ensures manifests are portable across platforms.
 
-### Normalization Strategy
-
 ```rust
-/// Normalize a path for storage in manifests.
-/// 
-/// This function:
-/// 1. Converts to absolute path WITHOUT resolving symlinks (preserves symlink structure)
-/// 2. Removes `.` and `..` components via lexical normalization
-/// 3. Converts Windows backslashes to forward slashes
-/// 4. Returns path relative to the asset root
-pub fn normalize_for_manifest(path: &Path, root: &Path) -> Result<String, FileSystemError> {
-    // Use absolute() not canonicalize() to avoid resolving symlinks
-    let abs_path = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(path)
-    };
-    
-    // Lexical normalization: remove . and .. without touching filesystem
-    let normalized = lexical_normalize(&abs_path);
-    
-    // Make relative to root
-    let relative = normalized.strip_prefix(root)
-        .map_err(|_| FileSystemError::PathOutsideRoot { 
-            path: normalized.display().to_string(),
-            root: root.display().to_string(),
-        })?;
-    
-    // Convert to POSIX-style path string
-    Ok(to_posix_path(relative))
-}
+use rusty_attachments_common::{normalize_for_manifest, from_posix_path};
 
-/// Convert a path to POSIX-style string (forward slashes)
-fn to_posix_path(path: &Path) -> String {
-    path.components()
-        .map(|c| c.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/")
-}
+// Normalize for manifest storage
+let manifest_path = normalize_for_manifest(
+    Path::new("/project/assets/texture.png"),
+    Path::new("/project"),
+)?;
+// Result: "assets/texture.png"
 
-/// Lexical path normalization without filesystem access.
-/// Removes `.` components and resolves `..` components lexically.
-fn lexical_normalize(path: &Path) -> PathBuf {
-    let mut components = Vec::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => { /* skip . */ }
-            Component::ParentDir => {
-                // Pop if we can, otherwise keep the ..
-                if !components.is_empty() && components.last() != Some(&Component::ParentDir) {
-                    components.pop();
-                } else {
-                    components.push(component);
-                }
-            }
-            _ => components.push(component),
-        }
-    }
-    components.iter().collect()
-}
-```
-
-### Denormalization for Download
-
-When downloading files, paths must be converted back to the host OS format:
-
-```rust
-/// Convert a manifest path to the host OS path format.
-pub fn denormalize_for_host(manifest_path: &str, destination_root: &Path) -> PathBuf {
-    // Split on forward slash (manifest format)
-    let components: Vec<&str> = manifest_path.split('/').collect();
-    
-    // Build path using OS-native separator
-    let mut result = destination_root.to_path_buf();
-    for component in components {
-        result.push(component);
-    }
-    result
-}
+// Convert back for download
+let local_path = from_posix_path("assets/texture.png", Path::new("/downloads"));
+// Result: PathBuf("/downloads/assets/texture.png")
 ```
 
 ### Glob Pattern Matching
@@ -918,6 +879,7 @@ To avoid redundant filesystem calls during path grouping and size calculations, 
 ```rust
 use std::sync::Mutex;
 use lru::LruCache;
+use rusty_attachments_common::DEFAULT_STAT_CACHE_CAPACITY;
 
 /// Cache for file stat results to avoid redundant filesystem calls.
 /// Thread-safe via internal mutex.
@@ -945,9 +907,9 @@ impl StatCache {
         }
     }
     
-    /// Create with default capacity (1024 entries).
-    pub fn default() -> Self {
-        Self::new(1024)
+    /// Create with default capacity from common constants.
+    pub fn with_default_capacity() -> Self {
+        Self::new(DEFAULT_STAT_CACHE_CAPACITY)
     }
     
     /// Get stat for a path, using cache if available.
@@ -1424,69 +1386,15 @@ impl FileSystemScanner {
 
 ## Windows Long Path Handling
 
-Windows has a default path length limit of 260 characters (MAX_PATH). For paths exceeding this limit, we use the `\\?\` prefix to access the extended-length path API.
-
-### Long Path Utilities
+Windows long path utilities are provided by the `common` crate. See [common.md](common.md) for details.
 
 ```rust
-/// Windows MAX_PATH limit
-#[cfg(windows)]
-pub const WINDOWS_MAX_PATH: usize = 260;
+use rusty_attachments_common::{to_long_path, exceeds_max_path, WINDOWS_MAX_PATH};
 
-/// Convert a path to Windows long path format if needed.
-/// 
-/// On Windows, paths longer than MAX_PATH (260 chars) need the `\\?\` prefix
-/// to access the extended-length path API. This function:
-/// 1. Returns the path unchanged if it's short enough
-/// 2. Adds `\\?\` prefix for long paths
-/// 3. Is a no-op on non-Windows platforms
-/// 
-/// # Note
-/// The `\\?\` prefix disables path normalization, so the path must be
-/// fully qualified (absolute) and use backslashes.
-#[cfg(windows)]
-pub fn to_long_path(path: &Path) -> PathBuf {
-    let path_str = path.to_string_lossy();
-    
-    // Already has long path prefix
-    if path_str.starts_with(r"\\?\") {
-        return path.to_path_buf();
-    }
-    
-    // Short enough, no prefix needed
-    if path_str.len() < WINDOWS_MAX_PATH {
-        return path.to_path_buf();
-    }
-    
-    // Convert to absolute and add prefix
-    let abs_path = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map(|cwd| cwd.join(path))
-            .unwrap_or_else(|_| path.to_path_buf())
-    };
-    
-    // Add \\?\ prefix
-    PathBuf::from(format!(r"\\?\{}", abs_path.display()))
-}
-
-#[cfg(not(windows))]
-pub fn to_long_path(path: &Path) -> PathBuf {
-    path.to_path_buf()
-}
-
-/// Check if a path would exceed Windows MAX_PATH limit.
-/// Always returns false on non-Windows platforms.
-pub fn exceeds_max_path(path: &Path) -> bool {
-    #[cfg(windows)]
-    {
-        path.to_string_lossy().len() >= WINDOWS_MAX_PATH
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
+// Check if path needs long path handling
+if exceeds_max_path(&path) {
+    let long_path = to_long_path(&path);
+    // Use long_path for file operations
 }
 ```
 
@@ -1495,6 +1403,8 @@ pub fn exceeds_max_path(path: &Path) -> bool {
 When downloading files, apply long path conversion before file operations:
 
 ```rust
+use rusty_attachments_common::to_long_path;
+
 // In download logic
 let local_path = to_long_path(&Path::new(&destination));
 std::fs::create_dir_all(local_path.parent().unwrap())?;
@@ -1699,14 +1609,15 @@ TooManyConflicts { path: String },
 ```toml
 # crates/filesystem/Cargo.toml
 [dependencies]
+rusty-attachments-common = { path = "../common" }
 rusty-attachments-model = { path = "../model" }
 walkdir = "2.4"
 glob = "0.3"
 rayon = "1.8"
 thiserror = "1.0"
-xxhash-rust = { version = "0.8", features = ["xxh3"] }
 lru = "0.12"
 libc = "0.2"
+log = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.52", features = ["Win32_Storage_FileSystem"] }
@@ -1765,6 +1676,7 @@ tempfile = "3.8"
 
 ## Related Documents
 
+- [common.md](common.md) - Shared path utilities, hash functions, progress callback
 - [model-design.md](model-design.md) - Manifest data structures
 - [storage-design.md](storage-design.md) - S3 upload/download operations
 - [upload.md](upload.md) - Original upload prototype

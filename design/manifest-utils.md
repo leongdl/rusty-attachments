@@ -31,6 +31,7 @@ crates/model/src/
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+use rusty_attachments_common::{hash_string, VersionNotCompatibleError};
 use crate::error::{ManifestError, ValidationError};
 use crate::hash::HashAlgorithm;
 use crate::version::ManifestType;
@@ -91,13 +92,17 @@ impl ManifestDiff {
 /// # Returns
 /// Vector of DiffEntry for all paths in either manifest.
 ///
+/// # Errors
+/// Returns `VersionNotCompatibleError` if either manifest is v2023-03-03.
+/// Use `compare_manifests_v2023` for v2023 manifests.
+///
 /// # Example
 /// ```
 /// use rusty_attachments_model::{Manifest, diff::compare_manifests};
 ///
 /// let base = Manifest::decode(base_json)?;
 /// let current = Manifest::decode(current_json)?;
-/// let entries = compare_manifests(&base, &current);
+/// let entries = compare_manifests(&base, &current)?;
 ///
 /// for entry in entries {
 ///     println!("{}: {:?}", entry.path, entry.status);
@@ -106,9 +111,9 @@ impl ManifestDiff {
 pub fn compare_manifests<'a>(
     reference: &'a Manifest,
     current: &'a Manifest,
-) -> Vec<DiffEntry<'a>> {
-    let ref_files = get_file_map(reference);
-    let cur_files = get_file_map(current);
+) -> Result<Vec<DiffEntry<'a>>, VersionNotCompatibleError> {
+    let ref_files = get_file_map(reference)?;
+    let cur_files = get_file_map(current)?;
 
     let mut results = Vec::new();
 
@@ -151,7 +156,7 @@ pub fn compare_manifests<'a>(
         }
     }
 
-    results
+    Ok(results)
 }
 
 /// Convert diff entries to a ManifestDiff summary.
@@ -290,6 +295,9 @@ pub fn fast_diff_files(
 /// * `parent_encoded` - The canonical JSON encoding of the parent (for hashing)
 /// * `current` - The current snapshot manifest
 ///
+/// # Errors
+/// Returns `VersionNotCompatibleError` if either manifest is v2023-03-03.
+///
 /// # Example
 /// ```
 /// use rusty_attachments_model::diff::create_diff_manifest;
@@ -306,10 +314,10 @@ pub fn create_diff_manifest(
     parent_encoded: &str,
     current: &Manifest,
 ) -> Result<Manifest, ManifestError> {
-    // Compute parent manifest hash using xxh128
-    let parent_hash = hash_string_xxh128(parent_encoded);
+    // Compute parent manifest hash using xxh128 (from common crate)
+    let parent_hash = hash_string(parent_encoded, HashAlgorithm::Xxh128);
 
-    let diff_entries = compare_manifests(parent, current);
+    let diff_entries = compare_manifests(parent, current)?;
 
     let mut files: Vec<ManifestFilePath> = Vec::new();
 
@@ -331,13 +339,13 @@ pub fn create_diff_manifest(
     }
 
     // Handle directory changes
-    let parent_dirs: HashSet<&str> = get_dir_set(parent);
-    let current_dirs: HashSet<&str> = get_dir_set(current);
+    let parent_dirs: HashSet<&str> = get_dir_set(parent)?;
+    let current_dirs: HashSet<&str> = get_dir_set(current)?;
 
     let mut dirs: Vec<ManifestDirectoryPath> = Vec::new();
 
     // New/existing directories from current
-    for dir in get_dirs(current) {
+    for dir in get_dirs(current)? {
         if !parent_dirs.contains(dir.path.as_str()) {
             dirs.push(dir.clone());
         }
@@ -360,10 +368,10 @@ pub fn create_diff_manifest(
     Ok(Manifest::V2025_12_04_beta(AssetManifest {
         hash_alg: current.hash_alg(),
         manifest_version: crate::version::ManifestVersion::V2025_12_04_beta,
+        manifest_type: ManifestType::Diff,
         dirs,
         paths: files,
         total_size,
-        manifest_type: ManifestType::Diff,
         parent_manifest_hash: Some(parent_hash),
     }))
 }
@@ -387,7 +395,8 @@ pub fn create_diff_manifest(
 /// A new snapshot manifest with the diff applied.
 ///
 /// # Errors
-/// Returns error if `diff` is not a diff manifest type.
+/// - Returns error if `diff` is not a diff manifest type.
+/// - Returns `VersionNotCompatibleError` if base is v2023-03-03.
 ///
 /// # Example
 /// ```
@@ -412,13 +421,13 @@ pub fn apply_diff_manifest(
     }
 
     // Start with base files
-    let mut files: HashMap<String, ManifestFilePath> = get_file_map(base)
+    let mut files: HashMap<String, ManifestFilePath> = get_file_map(base)?
         .into_iter()
         .map(|(k, v)| (k.to_string(), v.clone()))
         .collect();
 
     // Apply diff
-    for diff_entry in get_files(diff) {
+    for diff_entry in get_files(diff)? {
         if diff_entry.deleted {
             files.remove(&diff_entry.path);
         } else {
@@ -427,12 +436,12 @@ pub fn apply_diff_manifest(
     }
 
     // Handle directories
-    let mut dirs: HashMap<String, ManifestDirectoryPath> = get_dirs(base)
+    let mut dirs: HashMap<String, ManifestDirectoryPath> = get_dirs(base)?
         .iter()
-        .map(|d| (d.path.clone(), (*d).clone()))
+        .map(|d| (d.path.clone(), d.clone()))
         .collect();
 
-    for diff_dir in get_dirs(diff) {
+    for diff_dir in get_dirs(diff)? {
         if diff_dir.deleted {
             dirs.remove(&diff_dir.path);
         } else {
@@ -450,10 +459,10 @@ pub fn apply_diff_manifest(
     Ok(Manifest::V2025_12_04_beta(AssetManifest {
         hash_alg: base.hash_alg(),
         manifest_version: crate::version::ManifestVersion::V2025_12_04_beta,
+        manifest_type: ManifestType::Snapshot,
         dirs: dirs.into_values().collect(),
         paths: files.into_values().collect(),
         total_size,
-        manifest_type: ManifestType::Snapshot,
         parent_manifest_hash: None,
     }))
 }
@@ -463,38 +472,55 @@ pub fn apply_diff_manifest(
 // ============================================================================
 
 /// Extract file entries as a map from path to entry.
-fn get_file_map(manifest: &Manifest) -> HashMap<&str, &ManifestFilePath> {
+/// 
+/// # Errors
+/// Returns `VersionNotCompatibleError` for v2023-03-03 manifests.
+fn get_file_map(manifest: &Manifest) -> Result<HashMap<&str, &ManifestFilePath>, VersionNotCompatibleError> {
     match manifest {
-        Manifest::V2023_03_03(m) => {
-            // Convert v2023 paths to v2025 format for uniform handling
-            // Note: This requires a different approach - see implementation notes
-            HashMap::new() // Placeholder
-        }
+        // COMPAT: v2023-03-03 uses different path type, cannot be used with v2025 diff
+        Manifest::V2023_03_03(_) => Err(VersionNotCompatibleError::new(
+            "manifest diff with v2025 format",
+            "v2025-12-04-beta",
+        )),
         Manifest::V2025_12_04_beta(m) => {
-            m.paths.iter().map(|p| (p.path.as_str(), p)).collect()
+            Ok(m.paths.iter().map(|p| (p.path.as_str(), p)).collect())
         }
     }
 }
 
 /// Get files slice from manifest.
-fn get_files(manifest: &Manifest) -> &[ManifestFilePath] {
+/// 
+/// # Errors
+/// Returns `VersionNotCompatibleError` for v2023-03-03 manifests.
+fn get_files(manifest: &Manifest) -> Result<&[ManifestFilePath], VersionNotCompatibleError> {
     match manifest {
-        Manifest::V2023_03_03(_) => &[], // v2023 uses different type
-        Manifest::V2025_12_04_beta(m) => &m.paths,
+        // COMPAT: v2023-03-03 uses different path type
+        Manifest::V2023_03_03(_) => Err(VersionNotCompatibleError::new(
+            "v2025 file entries",
+            "v2025-12-04-beta",
+        )),
+        Manifest::V2025_12_04_beta(m) => Ok(&m.paths),
     }
 }
 
 /// Get directories slice from manifest.
-fn get_dirs(manifest: &Manifest) -> &[ManifestDirectoryPath] {
+/// 
+/// # Errors
+/// Returns `VersionNotCompatibleError` for v2023-03-03 manifests.
+fn get_dirs(manifest: &Manifest) -> Result<&[ManifestDirectoryPath], VersionNotCompatibleError> {
     match manifest {
-        Manifest::V2023_03_03(_) => &[],
-        Manifest::V2025_12_04_beta(m) => &m.dirs,
+        // COMPAT: v2023-03-03 does not track directories
+        Manifest::V2023_03_03(_) => Err(VersionNotCompatibleError::new(
+            "directory entries",
+            "v2025-12-04-beta",
+        )),
+        Manifest::V2025_12_04_beta(m) => Ok(&m.dirs),
     }
 }
 
 /// Get directory paths as a set.
-fn get_dir_set(manifest: &Manifest) -> HashSet<&str> {
-    get_dirs(manifest).iter().map(|d| d.path.as_str()).collect()
+fn get_dir_set(manifest: &Manifest) -> Result<HashSet<&str>, VersionNotCompatibleError> {
+    Ok(get_dirs(manifest)?.iter().map(|d| d.path.as_str()).collect())
 }
 
 /// Compare content hashes between two file entries.
@@ -505,12 +531,6 @@ fn content_hashes_equal(a: &ManifestFilePath, b: &ManifestFilePath) -> bool {
         (None, None, Some(c1), Some(c2)) => c1 == c2,
         _ => false,
     }
-}
-
-/// Hash a string using XXH128 and return hex string.
-fn hash_string_xxh128(data: &str) -> String {
-    use xxhash_rust::xxh3::xxh3_128;
-    format!("{:032x}", xxh3_128(data.as_bytes()))
 }
 ```
 
@@ -871,10 +891,10 @@ impl Manifest {
 # Add to crates/model/Cargo.toml
 
 [dependencies]
+rusty-attachments-common = { path = "../common" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "1.0"
-xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [dev-dependencies]
 pretty_assertions = "1.0"
@@ -1018,8 +1038,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 - [ ] Integration tests with filesystem
 
 ### Phase 3: Diff Manifest Creation
-- [ ] Add xxhash-rust dependency
-- [ ] Implement `hash_string_xxh128()` helper
+- [ ] Import `hash_string` from common crate
 - [ ] Implement `create_diff_manifest()`
 - [ ] Implement `apply_diff_manifest()`
 - [ ] Roundtrip tests
@@ -1129,6 +1148,7 @@ mod tests {
 
 ## Related Documents
 
+- [common.md](common.md) - Shared hash utilities (`hash_string`)
 - [model-design.md](model-design.md) - Core manifest model design
 - [storage-design.md](storage-design.md) - Storage abstraction for S3 operations
 

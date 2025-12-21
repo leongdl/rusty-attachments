@@ -79,3 +79,35 @@ If a function exceeds ~75 lines:
    - Create a dedicated struct with methods
 
 Provide concrete suggestions based on the function's purpose.
+
+## 6. Future Evolvability
+
+New functions and interfaces can be added over time. Legacy versions or implementations that cannot support new functionality should fail explicitly.
+
+- Return a clear "version not compatible" error rather than silently degrading
+- Mark incompatible code paths with `// COMPAT: <reason>` comments
+- Add tests that verify the error is raised for unsupported versions
+
+```rust
+// COMPAT: v2023-03-03 does not support chunked files
+pub fn get_chunk_hashes(&self) -> Result<&[String], ManifestError> {
+    match self {
+        Manifest::V2023_03_03(_) => Err(ManifestError::VersionNotCompatible {
+            feature: "chunked files",
+            min_version: "v2025-12-04-beta",
+        }),
+        Manifest::V2025_12_04_beta(m) => Ok(m.chunkhashes.as_deref().unwrap_or(&[])),
+    }
+}
+
+#[test]
+fn test_chunk_hashes_not_supported_v2023() {
+    let manifest = Manifest::V2023_03_03(/* ... */);
+    assert!(matches!(
+        manifest.get_chunk_hashes(),
+        Err(ManifestError::VersionNotCompatible { .. })
+    ));
+}
+```
+
+This ensures callers handle version differences explicitly rather than encountering unexpected behavior.

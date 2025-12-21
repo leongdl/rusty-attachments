@@ -168,10 +168,15 @@ pub struct ManifestFilePath {
 pub struct AssetManifest {
     pub hash_alg: HashAlgorithm,
     pub manifest_version: ManifestVersion,
+    /// Manifest type: Snapshot (full state) or Diff (changes only).
+    /// Defaults to Snapshot for backwards compatibility.
+    #[serde(default)]
+    pub manifest_type: ManifestType,
     pub dirs: Vec<ManifestDirectoryPath>,
     #[serde(rename = "files")]
     pub paths: Vec<ManifestFilePath>,
     pub total_size: u64,
+    /// Hash of the parent manifest (required for Diff type, None for Snapshot).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent_manifest_hash: Option<String>,
 }
@@ -181,6 +186,8 @@ pub struct AssetManifest {
 
 ```rust
 // manifest.rs
+
+use rusty_attachments_common::VersionNotCompatibleError;
 
 /// Version-agnostic manifest wrapper
 #[derive(Debug, Clone)]
@@ -196,10 +203,140 @@ impl Manifest {
     pub fn hash_alg(&self) -> HashAlgorithm;
     pub fn total_size(&self) -> u64;
     pub fn file_count(&self) -> usize;
+    
+    /// Get the manifest type (Snapshot or Diff).
+    /// 
+    /// # Note
+    /// v2023-03-03 only supports Snapshot type.
+    pub fn manifest_type(&self) -> ManifestType {
+        match self {
+            // COMPAT: v2023-03-03 does not support Diff manifests
+            Manifest::V2023_03_03(_) => ManifestType::Snapshot,
+            Manifest::V2025_12_04_beta(m) => m.manifest_type,
+        }
+    }
+    
+    /// Get file entries as v2025 format.
+    /// 
+    /// # Errors
+    /// Returns `VersionNotCompatibleError` for v2023-03-03 manifests.
+    /// Use `paths_v2023()` for v2023 manifests instead.
+    pub fn files(&self) -> Result<&[v2025_12_04::ManifestFilePath], VersionNotCompatibleError> {
+        match self {
+            // COMPAT: v2023-03-03 uses different path type
+            Manifest::V2023_03_03(_) => Err(VersionNotCompatibleError::new(
+                "files() with v2025 format",
+                "v2025-12-04-beta",
+            )),
+            Manifest::V2025_12_04_beta(m) => Ok(&m.paths),
+        }
+    }
+    
+    /// Get directory entries.
+    /// 
+    /// # Errors
+    /// Returns `VersionNotCompatibleError` for v2023-03-03 manifests.
+    pub fn dirs(&self) -> Result<&[v2025_12_04::ManifestDirectoryPath], VersionNotCompatibleError> {
+        match self {
+            // COMPAT: v2023-03-03 does not track directories
+            Manifest::V2023_03_03(_) => Err(VersionNotCompatibleError::new(
+                "directory entries",
+                "v2025-12-04-beta",
+            )),
+            Manifest::V2025_12_04_beta(m) => Ok(&m.dirs),
+        }
+    }
+    
+    /// Get chunk hashes for a file entry.
+    /// 
+    /// # Errors
+    /// Returns `VersionNotCompatibleError` for v2023-03-03 manifests.
+    pub fn supports_chunking(&self) -> bool {
+        match self {
+            // COMPAT: v2023-03-03 does not support chunked files
+            Manifest::V2023_03_03(_) => false,
+            Manifest::V2025_12_04_beta(_) => true,
+        }
+    }
+    
+    /// Get v2023 paths (for v2023 manifests only).
+    /// 
+    /// # Errors
+    /// Returns error for v2025 manifests.
+    pub fn paths_v2023(&self) -> Result<&[v2023_03_03::ManifestPath], VersionNotCompatibleError> {
+        match self {
+            Manifest::V2023_03_03(m) => Ok(&m.paths),
+            Manifest::V2025_12_04_beta(_) => Err(VersionNotCompatibleError::new(
+                "paths_v2023() on v2025 manifest",
+                "v2023-03-03",
+            )),
+        }
+    }
+    
+    /// Get the parent manifest hash (for diff manifests).
+    /// 
+    /// Returns `None` for snapshot manifests or v2023 manifests.
+    pub fn parent_manifest_hash(&self) -> Option<&str> {
+        match self {
+            // COMPAT: v2023-03-03 does not support diff manifests
+            Manifest::V2023_03_03(_) => None,
+            Manifest::V2025_12_04_beta(m) => m.parent_manifest_hash.as_deref(),
+        }
+    }
 }
 ```
 
 ## Validation Rules
+
+### Manifest Type Validation
+
+The `manifest_type` field determines how a manifest should be interpreted:
+
+```rust
+/// Manifest type determines the semantics of the manifest content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ManifestType {
+    /// Full snapshot of directory state. All files are present.
+    #[default]
+    Snapshot,
+    /// Diff against a parent manifest. Contains only changes.
+    Diff,
+}
+```
+
+**Consumer Usage:**
+
+```rust
+use rusty_attachments_model::{Manifest, ManifestType};
+
+fn process_manifest(manifest: &Manifest) -> Result<(), Error> {
+    match manifest.manifest_type() {
+        ManifestType::Snapshot => {
+            // Full manifest - all files are present
+            // Can be used directly for download
+            download_all_files(manifest)?;
+        }
+        ManifestType::Diff => {
+            // Diff manifest - must be applied to parent first
+            let parent_hash = manifest.parent_manifest_hash()
+                .ok_or(Error::MissingParentHash)?;
+            
+            // Fetch and decode parent manifest
+            let parent = fetch_manifest_by_hash(parent_hash)?;
+            
+            // Apply diff to get full snapshot
+            let resolved = apply_diff_manifest(&parent, manifest)?;
+            download_all_files(&resolved)?;
+        }
+    }
+    Ok(())
+}
+```
+
+**Validation Rules:**
+- `Diff` type MUST have `parent_manifest_hash` set
+- `Snapshot` type SHOULD NOT have `parent_manifest_hash` (ignored if present)
+- Deleted entries (`deleted: true`) are only valid in `Diff` manifests
 
 ### V2 Path Entry Validation
 

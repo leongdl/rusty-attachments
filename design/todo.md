@@ -11,10 +11,12 @@
 - [x] Job submission (manifest to job attachments conversion)
 - [x] Manifest utilities (diff/merge operations)
 - [x] Path mapping (dynamic path mapping, unique directory naming)
+- [x] Common module (shared constants, utilities, error types)
 
 ## Implementation TODO
 
 ### Core
+- [ ] Implement `common` crate with shared utilities
 - [ ] Implement business logic to upload a manifest
 - [ ] Implement logic to upload the manifest file
 - [ ] File folder scanning, snapshot folder, diff a folder
@@ -184,6 +186,7 @@ Features intentionally not implemented in Rust, with rationale:
 
 ## Related Documents
 
+- [common.md](common.md) - Shared constants, utilities, error types
 - [model-design.md](model-design.md) - Manifest data structures
 - [storage-design.md](storage-design.md) - Upload/download orchestration
 - [manifest-storage.md](manifest-storage.md) - Manifest S3 operations
