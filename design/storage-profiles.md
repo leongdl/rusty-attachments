@@ -272,6 +272,148 @@ let groups = group_asset_paths(&inputs, &outputs, &[], Some(&profile));
 
 ---
 
+## Missing Input Path Handling
+
+When processing input paths, some paths may not exist on the filesystem. The handling depends on the `require_paths_exist` option:
+
+### Validation Mode
+
+```rust
+/// Options for path validation during grouping
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PathValidationMode {
+    /// If true, missing input paths cause an error.
+    /// If false, missing paths are demoted to referenced_paths.
+    pub require_paths_exist: bool,
+}
+
+/// Errors for misconfigured inputs
+#[derive(Debug, thiserror::Error)]
+pub enum PathGroupingError {
+    #[error("Missing input files:\n{}", .missing.join("\n"))]
+    MissingInputFiles { missing: Vec<String> },
+    
+    #[error("Directories specified as input files:\n{}", .directories.join("\n"))]
+    DirectoriesAsFiles { directories: Vec<String> },
+    
+    #[error("Misconfigured inputs:\n{message}")]
+    MisconfiguredInputs { 
+        message: String,
+        missing: Vec<String>,
+        directories: Vec<String>,
+    },
+}
+```
+
+### Grouping with Validation
+
+```rust
+/// Result of path grouping with validation info
+#[derive(Debug, Clone)]
+pub struct PathGroupingResult {
+    /// Successfully grouped asset roots
+    pub groups: Vec<AssetRootGroup>,
+    /// Paths that were demoted to references (when require_paths_exist=false)
+    pub demoted_to_references: Vec<PathBuf>,
+    /// Paths under SHARED locations that were skipped
+    pub skipped_shared: Vec<PathBuf>,
+}
+
+/// Group paths with validation and error handling.
+pub fn group_asset_paths_validated(
+    input_paths: &[PathBuf],
+    output_paths: &[PathBuf],
+    referenced_paths: &[PathBuf],
+    storage_profile: Option<&StorageProfile>,
+    validation: PathValidationMode,
+) -> Result<PathGroupingResult, PathGroupingError> {
+    let mut missing_paths: Vec<PathBuf> = Vec::new();
+    let mut directory_paths: Vec<PathBuf> = Vec::new();
+    let mut demoted_to_references: Vec<PathBuf> = Vec::new();
+    let mut valid_inputs: Vec<PathBuf> = Vec::new();
+    let mut augmented_references: Vec<PathBuf> = referenced_paths.to_vec();
+    
+    // Validate each input path
+    for path in input_paths {
+        let abs_path = normalize_path(path);
+        
+        if !abs_path.exists() {
+            if validation.require_paths_exist {
+                missing_paths.push(abs_path);
+            } else {
+                // Demote to reference - will be associated with an asset root
+                // but won't be hashed/uploaded
+                demoted_to_references.push(abs_path.clone());
+                augmented_references.push(abs_path);
+            }
+            continue;
+        }
+        
+        if abs_path.is_dir() {
+            // Directories cannot be input files (they should be in output_paths)
+            directory_paths.push(abs_path);
+            continue;
+        }
+        
+        valid_inputs.push(abs_path);
+    }
+    
+    // Report errors if validation is strict
+    if validation.require_paths_exist && (!missing_paths.is_empty() || !directory_paths.is_empty()) {
+        return Err(PathGroupingError::MisconfiguredInputs {
+            message: "Job submission contains missing input files or directories specified as files.".into(),
+            missing: missing_paths.iter().map(|p| p.display().to_string()).collect(),
+            directories: directory_paths.iter().map(|p| p.display().to_string()).collect(),
+        });
+    }
+    
+    // Proceed with grouping using valid inputs
+    let groups = group_asset_paths(
+        &valid_inputs,
+        output_paths,
+        &augmented_references,
+        storage_profile,
+    );
+    
+    Ok(PathGroupingResult {
+        groups,
+        demoted_to_references,
+        skipped_shared: Vec::new(), // Populated during grouping
+    })
+}
+
+/// Normalize a path: absolute without resolving symlinks, with .. removed.
+fn normalize_path(path: &Path) -> PathBuf {
+    // Use absolute() not canonicalize() to preserve symlinks
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    
+    // Lexically normalize to remove . and ..
+    lexical_normalize(&abs)
+}
+```
+
+### Use Cases
+
+1. **Strict validation** (`require_paths_exist: true`):
+   - Used during final job submission
+   - All input files must exist
+   - Directories in input list cause errors
+   - Returns `PathGroupingError` on any issues
+
+2. **Lenient validation** (`require_paths_exist: false`):
+   - Used during job preview/dry-run
+   - Missing files are demoted to `referenced_paths`
+   - Allows partial job setup before all files exist
+   - Logs warnings but continues processing
+
+---
+
 ## Integration with File System Module
 
 The `SnapshotOptions` in `file_system.md` should accept an optional storage profile:

@@ -102,6 +102,9 @@ pub struct StorageSettings {
     pub region: String,
     /// AWS credentials (access key, secret key, session token)
     pub credentials: Option<AwsCredentials>,
+    /// Expected bucket owner account ID for security validation
+    /// When set, all S3 operations will include ExpectedBucketOwner parameter
+    pub expected_bucket_owner: Option<String>,
     /// Chunk size for large files (use CHUNK_SIZE_V2 or CHUNK_SIZE_NONE)
     pub chunk_size: u64,
     /// Upload retry settings
@@ -115,6 +118,7 @@ impl Default for StorageSettings {
         Self {
             region: "us-west-2".into(),
             credentials: None, // Use default credential chain
+            expected_bucket_owner: None, // No bucket owner validation by default
             chunk_size: CHUNK_SIZE_V2,
             upload_retry: RetrySettings::default(),
             download_retry: RetrySettings::default(),
@@ -283,6 +287,8 @@ pub struct TransferStatistics {
 /// Progress update for transfer operations
 #[derive(Debug, Clone)]
 pub struct TransferProgress {
+    /// Current operation status
+    pub status: ProgressStatus,
     /// Current operation type
     pub operation: OperationType,
     /// Current file/object being processed
@@ -301,12 +307,54 @@ pub struct TransferProgress {
     pub overall_total_bytes: u64,
 }
 
+/// Status of the overall transfer operation
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgressStatus {
+    /// Preparing/hashing files before upload
+    PreparingInProgress,
+    /// Upload in progress
+    UploadInProgress,
+    /// Download in progress
+    DownloadInProgress,
+    /// Snapshot (local copy) in progress
+    SnapshotInProgress,
+    /// Operation completed successfully
+    Complete,
+    /// Operation was cancelled
+    Cancelled,
+    /// Operation failed
+    Failed,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum OperationType {
     CheckingExistence,
     Uploading,
     Downloading,
     Hashing,
+}
+
+/// Summary statistics returned after operation completion or cancellation
+#[derive(Debug, Clone, Default)]
+pub struct SummaryStatistics {
+    /// Total files processed
+    pub total_files: u64,
+    /// Total bytes processed
+    pub total_bytes: u64,
+    /// Files that were transferred
+    pub processed_files: u64,
+    /// Bytes that were transferred
+    pub processed_bytes: u64,
+    /// Files that were skipped (already existed)
+    pub skipped_files: u64,
+    /// Bytes that were skipped
+    pub skipped_bytes: u64,
+    /// Total time elapsed in seconds
+    pub total_time: f64,
+    /// Transfer rate in bytes per second
+    pub transfer_rate: f64,
+    /// Final status
+    pub status: ProgressStatus,
 }
 
 /// Callback trait for progress reporting
@@ -326,6 +374,12 @@ pub enum StorageError {
     NotFound { bucket: String, key: String },
     /// Access denied
     AccessDenied { bucket: String, key: String, message: String },
+    /// Bucket owner mismatch (ExpectedBucketOwner validation failed)
+    BucketOwnerMismatch { 
+        bucket: String, 
+        expected_owner: String,
+        message: String,
+    },
     /// Size mismatch (corruption or incomplete upload)
     SizeMismatch { key: String, expected: u64, actual: u64 },
     /// Network error
@@ -333,7 +387,7 @@ pub enum StorageError {
     /// Local I/O error
     IoError { path: String, message: String },
     /// Operation cancelled by user
-    Cancelled,
+    Cancelled { partial_stats: SummaryStatistics },
     /// Other error
     Other { message: String },
 }
@@ -349,11 +403,16 @@ pub enum StorageError {
 /// Low-level S3 operations - implemented by each backend
 #[async_trait]
 pub trait StorageClient: Send + Sync {
+    /// Get the expected bucket owner (for security validation)
+    fn expected_bucket_owner(&self) -> Option<&str>;
+    
     /// Check if an object exists and return its size
     /// Returns None if object doesn't exist
+    /// Includes ExpectedBucketOwner if configured
     async fn head_object(&self, bucket: &str, key: &str) -> Result<Option<u64>, StorageError>;
     
     /// Upload bytes to S3
+    /// Includes ExpectedBucketOwner if configured
     async fn put_object(
         &self,
         bucket: &str,
@@ -364,6 +423,7 @@ pub trait StorageClient: Send + Sync {
     ) -> Result<(), StorageError>;
     
     /// Upload from file path to S3 (for large files, enables streaming)
+    /// Includes ExpectedBucketOwner if configured
     async fn put_object_from_file(
         &self,
         bucket: &str,
@@ -407,7 +467,14 @@ pub trait StorageClient: Send + Sync {
         progress: Option<&dyn ProgressCallback>,
     ) -> Result<(), StorageError>;
     
-    /// List objects with prefix
+    /// List objects with prefix.
+    /// 
+    /// This method handles S3 pagination internally, returning all objects
+    /// under the given prefix. For large result sets (thousands of objects),
+    /// the implementation should use the S3 ListObjectsV2 paginator.
+    /// 
+    /// # Returns
+    /// All objects under the prefix, with their metadata including LastModified.
     async fn list_objects(
         &self,
         bucket: &str,
@@ -420,7 +487,8 @@ pub trait StorageClient: Send + Sync {
 pub struct ObjectInfo {
     pub key: String,
     pub size: u64,
-    pub last_modified: Option<i64>,  // Unix timestamp
+    /// Unix timestamp (seconds since epoch)
+    pub last_modified: Option<i64>,
     pub etag: Option<String>,
 }
 ```
@@ -629,14 +697,88 @@ pub mod download_logic {
         // Handle path separators, directory creation, etc.
     }
     
-    /// Resolve conflict for existing file
+    /// Resolve conflict for existing file.
+    /// 
+    /// For CreateCopy mode, generates unique paths like:
+    /// - "file (1).ext"
+    /// - "file (2).ext"
+    /// - etc.
+    /// 
+    /// Thread-safe: uses atomic file creation to handle concurrent downloads.
     pub fn resolve_conflict(
-        path: &str,
+        path: &Path,
         resolution: ConflictResolution,
-        existing_files: &HashSet<String>,
-    ) -> ConflictAction {
-        // Returns Skip, Overwrite, or new path for CreateCopy
+    ) -> Result<ConflictAction, FileSystemError> {
+        match resolution {
+            ConflictResolution::Skip => Ok(ConflictAction::Skip),
+            ConflictResolution::Overwrite => Ok(ConflictAction::Overwrite),
+            ConflictResolution::CreateCopy => {
+                let new_path = generate_unique_copy_path(path)?;
+                Ok(ConflictAction::UseNewPath(new_path))
+            }
+        }
     }
+    
+    /// Generate a unique file path for conflict resolution.
+    /// 
+    /// Tries "file (1).ext", "file (2).ext", etc. until finding
+    /// a path that doesn't exist. Uses atomic file creation to
+    /// handle race conditions in concurrent downloads.
+    /// 
+    /// # Algorithm
+    /// 1. Start with counter = 1
+    /// 2. Generate candidate path: "{stem} ({counter}){extension}"
+    /// 3. Try to atomically create the file (O_CREAT | O_EXCL)
+    /// 4. If file exists, increment counter and retry
+    /// 5. Return the successfully created path
+    pub fn generate_unique_copy_path(original: &Path) -> Result<PathBuf, FileSystemError> {
+        let stem = original.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        let extension = original.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| format!(".{}", e))
+            .unwrap_or_default();
+        let parent = original.parent().unwrap_or(Path::new(""));
+        
+        let mut counter = 1u32;
+        loop {
+            let new_name = format!("{} ({}){}", stem, counter, extension);
+            let candidate = parent.join(&new_name);
+            
+            // Try atomic creation
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)  // Fails if file exists
+                .open(&candidate)
+            {
+                Ok(_) => return Ok(candidate),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    counter += 1;
+                    if counter > 10000 {
+                        return Err(FileSystemError::TooManyConflicts {
+                            path: original.display().to_string(),
+                        });
+                    }
+                }
+                Err(e) => return Err(FileSystemError::IoError {
+                    path: candidate.display().to_string(),
+                    source: e,
+                }),
+            }
+        }
+    }
+}
+
+/// Action to take for a file conflict
+#[derive(Debug, Clone)]
+pub enum ConflictAction {
+    /// Skip downloading this file
+    Skip,
+    /// Overwrite the existing file
+    Overwrite,
+    /// Use a new path (for CreateCopy mode)
+    UseNewPath(PathBuf),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -671,12 +813,37 @@ impl CrtStorageClient {
 }
 
 impl StorageClient for CrtStorageClient {
+    fn expected_bucket_owner(&self) -> Option<&str> {
+        self.settings.expected_bucket_owner.as_deref()
+    }
+    
     // Implement all trait methods using CRT APIs
     // - Uses aws-crt-s3 for high-performance transfers
     // - Automatic multipart for large objects
     // - Connection pooling and retry logic (uses settings.upload_retry / download_retry)
+    // - All operations include ExpectedBucketOwner when configured
 }
 ```
+
+#### CRT Thread Pool Management
+
+The AWS CRT manages its own internal thread pool for I/O operations. We do NOT need to create a separate thread pool for parallel uploads:
+
+- **CRT handles parallelism internally**: The CRT S3 client automatically parallelizes multipart uploads and manages connection pooling
+- **No external ThreadPoolExecutor needed**: Unlike the Python implementation which uses `concurrent.futures.ThreadPoolExecutor`, the CRT handles this at the C layer
+- **Configuration via CRT settings**: Concurrency is controlled through CRT client configuration, not Rust-side thread pools
+
+```rust
+// CRT client configuration handles parallelism
+let s3_client_config = aws_crt_s3::ClientConfig::new()
+    .with_throughput_target_gbps(10.0)  // CRT auto-tunes parallelism
+    .with_part_size(8 * 1024 * 1024);   // 8MB parts for multipart
+```
+
+The small/large file separation logic (see Upload Module) is still useful for:
+- Prioritizing which files to start first
+- Reducing wasted bandwidth on cancellation
+- But the actual parallel execution is handled by CRT, not our code
 
 ### WASM/JS SDK Backend
 

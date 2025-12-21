@@ -17,6 +17,7 @@ Both operations support include/exclude glob patterns for filtering which files 
 2. **Flexibility** - Configurable glob patterns for include/exclude filtering
 3. **Composability** - Operations can be chained (snapshot → diff → upload)
 4. **Cross-platform** - Works on Windows, macOS, and Linux with proper path handling
+5. **Security** - Prevent symlink attacks and path traversal vulnerabilities
 
 ---
 
@@ -60,6 +61,9 @@ rusty-attachments/
 │           ├── snapshot.rs       # Snapshot operation
 │           ├── diff.rs           # Diff operation
 │           ├── hash.rs           # File hashing utilities
+│           ├── symlink.rs        # Symlink security validation
+│           ├── stat_cache.rs     # File stat caching
+│           ├── path_utils.rs     # Path normalization utilities
 │           └── error.rs          # Error types
 ```
 
@@ -719,6 +723,21 @@ pub enum FileSystemError {
     #[error("Symlink has absolute target: {symlink} -> {target}")]
     SymlinkAbsoluteTarget { symlink: String, target: String },
     
+    #[error("Symlink not allowed when opening file: {path}")]
+    SymlinkNotAllowed { path: String },
+    
+    #[error("Path is outside asset root: {path} not in {root}")]
+    PathOutsideRoot { path: String, root: String },
+    
+    #[error("Invalid path: {path}")]
+    InvalidPath { path: String },
+    
+    #[error("Path mismatch - expected {expected}, got {actual}")]
+    PathMismatch { expected: String, actual: String },
+    
+    #[error("Windows path verification failed for: {path}")]
+    WindowsPathVerificationFailed { path: String },
+    
     #[error("IO error at {path}: {source}")]
     IoError { path: String, source: std::io::Error },
     
@@ -778,6 +797,903 @@ pub trait HashCache: Send + Sync {
 
 ---
 
+## Path Normalization
+
+All paths in manifests use POSIX-style forward slashes (`/`) regardless of the host OS. This ensures manifests are portable across platforms.
+
+### Normalization Strategy
+
+```rust
+/// Normalize a path for storage in manifests.
+/// 
+/// This function:
+/// 1. Converts to absolute path WITHOUT resolving symlinks (preserves symlink structure)
+/// 2. Removes `.` and `..` components via lexical normalization
+/// 3. Converts Windows backslashes to forward slashes
+/// 4. Returns path relative to the asset root
+pub fn normalize_for_manifest(path: &Path, root: &Path) -> Result<String, FileSystemError> {
+    // Use absolute() not canonicalize() to avoid resolving symlinks
+    let abs_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    
+    // Lexical normalization: remove . and .. without touching filesystem
+    let normalized = lexical_normalize(&abs_path);
+    
+    // Make relative to root
+    let relative = normalized.strip_prefix(root)
+        .map_err(|_| FileSystemError::PathOutsideRoot { 
+            path: normalized.display().to_string(),
+            root: root.display().to_string(),
+        })?;
+    
+    // Convert to POSIX-style path string
+    Ok(to_posix_path(relative))
+}
+
+/// Convert a path to POSIX-style string (forward slashes)
+fn to_posix_path(path: &Path) -> String {
+    path.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Lexical path normalization without filesystem access.
+/// Removes `.` components and resolves `..` components lexically.
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => { /* skip . */ }
+            Component::ParentDir => {
+                // Pop if we can, otherwise keep the ..
+                if !components.is_empty() && components.last() != Some(&Component::ParentDir) {
+                    components.pop();
+                } else {
+                    components.push(component);
+                }
+            }
+            _ => components.push(component),
+        }
+    }
+    components.iter().collect()
+}
+```
+
+### Denormalization for Download
+
+When downloading files, paths must be converted back to the host OS format:
+
+```rust
+/// Convert a manifest path to the host OS path format.
+pub fn denormalize_for_host(manifest_path: &str, destination_root: &Path) -> PathBuf {
+    // Split on forward slash (manifest format)
+    let components: Vec<&str> = manifest_path.split('/').collect();
+    
+    // Build path using OS-native separator
+    let mut result = destination_root.to_path_buf();
+    for component in components {
+        result.push(component);
+    }
+    result
+}
+```
+
+### Glob Pattern Matching
+
+Glob patterns are always matched against normalized POSIX-style paths:
+
+```rust
+impl GlobFilter {
+    /// Check if a path matches the filter criteria.
+    /// The path should already be normalized to POSIX format.
+    pub fn matches(&self, normalized_path: &str) -> bool {
+        // Patterns use forward slashes regardless of host OS
+        // e.g., "**/*.txt" works on both Windows and Unix
+        
+        let included = if self.include.is_empty() {
+            true
+        } else {
+            self.include.iter().any(|pattern| glob_match(pattern, normalized_path))
+        };
+        
+        let excluded = self.exclude.iter().any(|pattern| glob_match(pattern, normalized_path));
+        
+        included && !excluded
+    }
+}
+```
+
+---
+
+## File Stat Caching
+
+To avoid redundant filesystem calls during path grouping and size calculations, we use an LRU cache for file stat results.
+
+### StatCache
+
+```rust
+use std::sync::Mutex;
+use lru::LruCache;
+
+/// Cache for file stat results to avoid redundant filesystem calls.
+/// Thread-safe via internal mutex.
+pub struct StatCache {
+    cache: Mutex<LruCache<PathBuf, Option<StatResult>>>,
+}
+
+/// Cached stat result
+#[derive(Debug, Clone)]
+pub struct StatResult {
+    pub size: u64,
+    pub mtime_us: i64,
+    pub is_dir: bool,
+    pub is_symlink: bool,
+    pub mode: u32,
+}
+
+impl StatCache {
+    /// Create a new stat cache with the given capacity.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            cache: Mutex::new(LruCache::new(
+                std::num::NonZeroUsize::new(capacity).unwrap()
+            )),
+        }
+    }
+    
+    /// Create with default capacity (1024 entries).
+    pub fn default() -> Self {
+        Self::new(1024)
+    }
+    
+    /// Get stat for a path, using cache if available.
+    /// Returns None if the path doesn't exist or can't be accessed.
+    pub fn stat(&self, path: &Path) -> Option<StatResult> {
+        let mut cache = self.cache.lock().unwrap();
+        
+        if let Some(cached) = cache.get(path) {
+            return cached.clone();
+        }
+        
+        // Not in cache, perform actual stat
+        let result = self.do_stat(path);
+        cache.put(path.to_path_buf(), result.clone());
+        result
+    }
+    
+    /// Check if path exists using cached stat.
+    pub fn exists(&self, path: &Path) -> bool {
+        self.stat(path).is_some()
+    }
+    
+    /// Check if path is a directory using cached stat.
+    pub fn is_dir(&self, path: &Path) -> bool {
+        self.stat(path).map(|s| s.is_dir).unwrap_or(false)
+    }
+    
+    /// Check if path is a symlink using cached stat (uses lstat).
+    pub fn is_symlink(&self, path: &Path) -> bool {
+        self.stat(path).map(|s| s.is_symlink).unwrap_or(false)
+    }
+    
+    /// Get file size using cached stat.
+    pub fn size(&self, path: &Path) -> u64 {
+        self.stat(path).map(|s| s.size).unwrap_or(0)
+    }
+    
+    /// Clear the cache.
+    pub fn clear(&self) {
+        self.cache.lock().unwrap().clear();
+    }
+    
+    fn do_stat(&self, path: &Path) -> Option<StatResult> {
+        // Use lstat to not follow symlinks
+        let metadata = match path.symlink_metadata() {
+            Ok(m) => m,
+            Err(_) => return None,
+        };
+        
+        let is_symlink = metadata.file_type().is_symlink();
+        
+        // For symlinks, we need the target's metadata for size
+        let (size, is_dir) = if is_symlink {
+            match path.metadata() {
+                Ok(target_meta) => (target_meta.len(), target_meta.is_dir()),
+                Err(_) => (0, false), // Broken symlink
+            }
+        } else {
+            (metadata.len(), metadata.is_dir())
+        };
+        
+        let mtime_us = metadata.modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_micros() as i64)
+            .unwrap_or(0);
+        
+        #[cfg(unix)]
+        let mode = {
+            use std::os::unix::fs::PermissionsExt;
+            metadata.permissions().mode()
+        };
+        #[cfg(not(unix))]
+        let mode = 0;
+        
+        Some(StatResult {
+            size,
+            mtime_us,
+            is_dir,
+            is_symlink,
+            mode,
+        })
+    }
+}
+```
+
+### Usage in Scanner
+
+```rust
+impl FileSystemScanner {
+    pub fn new() -> Self {
+        Self {
+            thread_pool: ThreadPool::new(),
+            stat_cache: StatCache::default(),
+        }
+    }
+    
+    /// Calculate total size of files efficiently using stat cache.
+    pub fn calculate_total_size(&self, paths: &[PathBuf]) -> u64 {
+        paths.iter()
+            .map(|p| self.stat_cache.size(p))
+            .sum()
+    }
+}
+```
+
+---
+
+## Symlink Security
+
+Symlinks pose security risks if they can point outside the asset root or to sensitive system files. We implement strict validation during upload.
+
+### Security Requirements
+
+1. **Relative targets only**: Symlinks must have relative targets, not absolute paths
+2. **Target within root**: The resolved target must remain within the asset root directory
+3. **No symlink following during file reads**: When reading file content for hashing/upload, we must not follow symlinks to prevent TOCTOU attacks
+
+### Symlink Validation
+
+```rust
+/// Validate a symlink for inclusion in a manifest.
+/// 
+/// # Security Checks
+/// 1. Target must be relative (no absolute paths)
+/// 2. Resolved target must be within the asset root
+/// 3. Target path must not escape via `..` traversal
+pub fn validate_symlink(
+    symlink_path: &Path,
+    root: &Path,
+) -> Result<SymlinkInfo, FileSystemError> {
+    // Read the symlink target without following it
+    let target = std::fs::read_link(symlink_path)
+        .map_err(|e| FileSystemError::IoError { 
+            path: symlink_path.display().to_string(), 
+            source: e 
+        })?;
+    
+    // Check 1: Target must be relative
+    if target.is_absolute() {
+        return Err(FileSystemError::SymlinkAbsoluteTarget {
+            symlink: symlink_path.display().to_string(),
+            target: target.display().to_string(),
+        });
+    }
+    
+    // Check 2: Resolve target relative to symlink's parent directory
+    let symlink_dir = symlink_path.parent()
+        .ok_or_else(|| FileSystemError::InvalidPath { 
+            path: symlink_path.display().to_string() 
+        })?;
+    
+    // Lexically resolve the target (don't touch filesystem)
+    let resolved = lexical_resolve(symlink_dir, &target);
+    
+    // Check 3: Resolved path must be within root
+    if !is_within_root(&resolved, root) {
+        return Err(FileSystemError::SymlinkEscapesRoot {
+            symlink: symlink_path.display().to_string(),
+            target: target.display().to_string(),
+        });
+    }
+    
+    Ok(SymlinkInfo {
+        path: symlink_path.to_path_buf(),
+        target: to_posix_path(&target),
+        resolved_target: resolved,
+    })
+}
+
+/// Lexically resolve a relative path from a base directory.
+/// Does NOT access the filesystem - pure path manipulation.
+fn lexical_resolve(base: &Path, relative: &Path) -> PathBuf {
+    let mut result = base.to_path_buf();
+    for component in relative.components() {
+        match component {
+            Component::ParentDir => { result.pop(); }
+            Component::CurDir => { /* skip */ }
+            Component::Normal(name) => { result.push(name); }
+            _ => { result.push(component); }
+        }
+    }
+    result
+}
+
+/// Check if a path is within the root directory.
+fn is_within_root(path: &Path, root: &Path) -> bool {
+    // Normalize both paths lexically
+    let norm_path = lexical_normalize(path);
+    let norm_root = lexical_normalize(root);
+    norm_path.starts_with(&norm_root)
+}
+
+#[derive(Debug, Clone)]
+pub struct SymlinkInfo {
+    /// Path to the symlink itself
+    pub path: PathBuf,
+    /// Original target as stored in symlink (relative, POSIX format)
+    pub target: String,
+    /// Fully resolved target path
+    pub resolved_target: PathBuf,
+}
+```
+
+### Secure File Opening
+
+When reading files for hashing or upload, we must ensure we're not following symlinks to unexpected locations:
+
+```rust
+/// Securely open a file for reading, preventing symlink attacks.
+/// 
+/// # Security
+/// - Uses O_NOFOLLOW on Unix to prevent symlink following
+/// - On Windows, verifies the final path matches the expected path
+pub fn open_file_secure(path: &Path, root: &Path) -> Result<File, FileSystemError> {
+    // Verify path is within root before opening
+    let abs_path = path.canonicalize()
+        .map_err(|e| FileSystemError::IoError { 
+            path: path.display().to_string(), 
+            source: e 
+        })?;
+    
+    if !abs_path.starts_with(root.canonicalize().unwrap_or_else(|_| root.to_path_buf())) {
+        return Err(FileSystemError::PathOutsideRoot {
+            path: path.display().to_string(),
+            root: root.display().to_string(),
+        });
+    }
+    
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|e| {
+                if e.raw_os_error() == Some(libc::ELOOP) {
+                    FileSystemError::SymlinkNotAllowed { 
+                        path: path.display().to_string() 
+                    }
+                } else {
+                    FileSystemError::IoError { 
+                        path: path.display().to_string(), 
+                        source: e 
+                    }
+                }
+            })
+    }
+    
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .map_err(|e| FileSystemError::IoError { 
+                path: path.display().to_string(), 
+                source: e 
+            })?;
+        
+        // Verify the opened file's path matches expected
+        verify_windows_file_path(&file, path)?;
+        
+        Ok(file)
+    }
+}
+
+#[cfg(windows)]
+fn verify_windows_file_path(file: &File, expected_path: &Path) -> Result<(), FileSystemError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFinalPathNameByHandleW, VOLUME_NAME_DOS
+    };
+    
+    let handle = file.as_raw_handle();
+    let mut buffer = [0u16; 4096];
+    
+    let len = unsafe {
+        GetFinalPathNameByHandleW(
+            handle as _,
+            buffer.as_mut_ptr(),
+            buffer.len() as u32,
+            VOLUME_NAME_DOS,
+        )
+    };
+    
+    if len == 0 || len as usize > buffer.len() {
+        return Err(FileSystemError::WindowsPathVerificationFailed {
+            path: expected_path.display().to_string(),
+        });
+    }
+    
+    let final_path = String::from_utf16_lossy(&buffer[..len as usize]);
+    
+    // Strip \\?\ prefix if present
+    let final_path = final_path
+        .strip_prefix(r"\\?\")
+        .or_else(|| final_path.strip_prefix(r"\\?\UNC\").map(|s| &s[..]))
+        .unwrap_or(&final_path);
+    
+    let expected_str = expected_path.canonicalize()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| expected_path.display().to_string());
+    
+    if final_path != expected_str {
+        return Err(FileSystemError::PathMismatch {
+            expected: expected_str,
+            actual: final_path.to_string(),
+        });
+    }
+    
+    Ok(())
+}
+```
+
+### Secure File Reader Guard
+
+For upload operations, we need a pattern that gracefully handles symlinks by skipping them rather than failing:
+
+```rust
+/// A guard that ensures a file is opened securely and closed properly.
+/// 
+/// This is similar to Python's context manager pattern - it returns None
+/// if the file cannot be opened securely (e.g., it's a symlink), allowing
+/// the caller to skip the file gracefully.
+pub struct SecureFileReader {
+    file: Option<File>,
+    path: PathBuf,
+}
+
+impl SecureFileReader {
+    /// Attempt to open a file securely.
+    /// 
+    /// Returns a reader with `file = None` if:
+    /// - The path is a symlink (on systems without O_NOFOLLOW support)
+    /// - The file doesn't exist
+    /// - Permission denied
+    /// 
+    /// The caller should check `is_valid()` before reading.
+    pub fn open(path: &Path, root: &Path) -> Self {
+        let file = open_file_secure_optional(path, root);
+        Self {
+            file,
+            path: path.to_path_buf(),
+        }
+    }
+    
+    /// Check if the file was opened successfully.
+    pub fn is_valid(&self) -> bool {
+        self.file.is_some()
+    }
+    
+    /// Get a reference to the file, if opened successfully.
+    pub fn file(&self) -> Option<&File> {
+        self.file.as_ref()
+    }
+    
+    /// Take ownership of the file.
+    pub fn into_file(self) -> Option<File> {
+        self.file
+    }
+}
+
+/// Open a file securely, returning None on failure instead of error.
+/// 
+/// This is useful for upload operations where we want to skip problematic
+/// files (symlinks, missing files) rather than fail the entire operation.
+fn open_file_secure_optional(path: &Path, root: &Path) -> Option<File> {
+    // Verify path is within root
+    let abs_path = match path.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!("Failed to canonicalize path {}: {}", path.display(), e);
+            return None;
+        }
+    };
+    
+    let root_canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    if !abs_path.starts_with(&root_canonical) {
+        log::warn!("Path {} is outside root {}", path.display(), root.display());
+        return None;
+    }
+    
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+        {
+            Ok(f) => Some(f),
+            Err(e) => {
+                if e.raw_os_error() == Some(libc::ELOOP) {
+                    log::warn!("Skipping symlink: {}", path.display());
+                } else {
+                    log::warn!("Failed to open {}: {}", path.display(), e);
+                }
+                None
+            }
+        }
+    }
+    
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                log::warn!("Failed to open {}: {}", path.display(), e);
+                return None;
+            }
+        };
+        
+        // Verify the opened file's path matches expected
+        if verify_windows_file_path(&file, path).is_err() {
+            log::warn!("Path mismatch for {}, skipping", path.display());
+            return None;
+        }
+        
+        Some(file)
+    }
+}
+```
+
+### Symlink Handling in Snapshot
+
+```rust
+impl FileSystemScanner {
+    fn categorize_entries(
+        &self,
+        entries: Vec<WalkEntry>,
+        options: &SnapshotOptions,
+    ) -> Result<(Vec<FileInfo>, Vec<SymlinkInfo>, Vec<DirInfo>), FileSystemError> {
+        let mut files = Vec::new();
+        let mut symlinks = Vec::new();
+        let mut dirs = Vec::new();
+        
+        for entry in entries {
+            if self.stat_cache.is_symlink(&entry.path) {
+                if options.follow_symlinks {
+                    // Treat as regular file (will read through symlink)
+                    // But still validate it doesn't escape root
+                    let info = validate_symlink(&entry.path, &options.root)?;
+                    files.push(FileInfo::from_symlink_target(&info));
+                } else {
+                    // Capture as symlink entry in manifest
+                    let info = validate_symlink(&entry.path, &options.root)?;
+                    symlinks.push(info);
+                }
+            } else if self.stat_cache.is_dir(&entry.path) {
+                dirs.push(DirInfo { path: entry.path });
+            } else {
+                files.push(FileInfo { path: entry.path });
+            }
+        }
+        
+        Ok((files, symlinks, dirs))
+    }
+}
+```
+
+---
+
+## Windows Long Path Handling
+
+Windows has a default path length limit of 260 characters (MAX_PATH). For paths exceeding this limit, we use the `\\?\` prefix to access the extended-length path API.
+
+### Long Path Utilities
+
+```rust
+/// Windows MAX_PATH limit
+#[cfg(windows)]
+pub const WINDOWS_MAX_PATH: usize = 260;
+
+/// Convert a path to Windows long path format if needed.
+/// 
+/// On Windows, paths longer than MAX_PATH (260 chars) need the `\\?\` prefix
+/// to access the extended-length path API. This function:
+/// 1. Returns the path unchanged if it's short enough
+/// 2. Adds `\\?\` prefix for long paths
+/// 3. Is a no-op on non-Windows platforms
+/// 
+/// # Note
+/// The `\\?\` prefix disables path normalization, so the path must be
+/// fully qualified (absolute) and use backslashes.
+#[cfg(windows)]
+pub fn to_long_path(path: &Path) -> PathBuf {
+    let path_str = path.to_string_lossy();
+    
+    // Already has long path prefix
+    if path_str.starts_with(r"\\?\") {
+        return path.to_path_buf();
+    }
+    
+    // Short enough, no prefix needed
+    if path_str.len() < WINDOWS_MAX_PATH {
+        return path.to_path_buf();
+    }
+    
+    // Convert to absolute and add prefix
+    let abs_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    
+    // Add \\?\ prefix
+    PathBuf::from(format!(r"\\?\{}", abs_path.display()))
+}
+
+#[cfg(not(windows))]
+pub fn to_long_path(path: &Path) -> PathBuf {
+    path.to_path_buf()
+}
+
+/// Check if a path would exceed Windows MAX_PATH limit.
+/// Always returns false on non-Windows platforms.
+pub fn exceeds_max_path(path: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        path.to_string_lossy().len() >= WINDOWS_MAX_PATH
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+```
+
+### Usage in Download
+
+When downloading files, apply long path conversion before file operations:
+
+```rust
+// In download logic
+let local_path = to_long_path(&Path::new(&destination));
+std::fs::create_dir_all(local_path.parent().unwrap())?;
+// ... download to local_path
+```
+
+---
+
+## File System Permissions
+
+After downloading files, we may need to set ownership and permissions so that job worker processes can access them. This is particularly important in multi-user environments.
+
+### Permission Settings
+
+```rust
+/// File system permission settings (platform-specific)
+#[derive(Debug, Clone)]
+pub enum FileSystemPermissionSettings {
+    Posix(PosixPermissionSettings),
+    Windows(WindowsPermissionSettings),
+}
+
+/// POSIX file system permission settings.
+/// Permissions are OR'd with existing permissions.
+#[derive(Debug, Clone)]
+pub struct PosixPermissionSettings {
+    /// Target user for ownership (chown)
+    pub os_user: String,
+    /// Target group for ownership (chgrp)
+    pub os_group: String,
+    /// Permission mode to add to directories (e.g., 0o750)
+    pub dir_mode: u32,
+    /// Permission mode to add to files (e.g., 0o640)
+    pub file_mode: u32,
+}
+
+/// Windows file system permission settings.
+#[derive(Debug, Clone)]
+pub struct WindowsPermissionSettings {
+    /// Target user for ACL
+    pub os_user: String,
+    /// Permission level for directories
+    pub dir_mode: WindowsPermission,
+    /// Permission level for files
+    pub file_mode: WindowsPermission,
+}
+
+/// Windows permission levels
+#[derive(Debug, Clone, Copy)]
+pub enum WindowsPermission {
+    Read,
+    Write,
+    Execute,
+    ReadWrite,
+    FullControl,
+}
+```
+
+### Setting Permissions
+
+```rust
+/// Set file system permissions on downloaded files.
+/// 
+/// This function:
+/// 1. Sets permissions on each file
+/// 2. Collects unique parent directories
+/// 3. Sets permissions on directories from root down
+/// 
+/// # Arguments
+/// * `file_paths` - Absolute paths to downloaded files
+/// * `local_root` - Root directory for the download
+/// * `settings` - Permission settings to apply
+pub fn set_file_permissions(
+    file_paths: &[PathBuf],
+    local_root: &Path,
+    settings: &FileSystemPermissionSettings,
+) -> Result<(), FileSystemError> {
+    match settings {
+        FileSystemPermissionSettings::Posix(posix) => {
+            set_posix_permissions(file_paths, local_root, posix)
+        }
+        FileSystemPermissionSettings::Windows(windows) => {
+            set_windows_permissions(file_paths, local_root, windows)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn set_posix_permissions(
+    file_paths: &[PathBuf],
+    local_root: &Path,
+    settings: &PosixPermissionSettings,
+) -> Result<(), FileSystemError> {
+    use std::os::unix::fs::PermissionsExt;
+    
+    let mut dirs_to_update: HashSet<PathBuf> = HashSet::new();
+    
+    // Set permissions on files and collect directories
+    for file_path in file_paths {
+        // Validate path is within root
+        if !file_path.starts_with(local_root) {
+            return Err(FileSystemError::PathOutsideRoot {
+                path: file_path.display().to_string(),
+                root: local_root.display().to_string(),
+            });
+        }
+        
+        // Change group ownership
+        change_group(file_path, &settings.os_group)?;
+        
+        // Add file permissions (OR with existing)
+        let metadata = std::fs::metadata(file_path)?;
+        let current_mode = metadata.permissions().mode();
+        let new_mode = current_mode | settings.file_mode;
+        std::fs::set_permissions(file_path, std::fs::Permissions::from_mode(new_mode))?;
+        
+        // Collect parent directories
+        if let Ok(relative) = file_path.strip_prefix(local_root) {
+            for ancestor in relative.ancestors().skip(1) {
+                if !ancestor.as_os_str().is_empty() {
+                    dirs_to_update.insert(local_root.join(ancestor));
+                }
+            }
+        }
+    }
+    
+    // Set permissions on directories
+    for dir_path in dirs_to_update {
+        change_group(&dir_path, &settings.os_group)?;
+        
+        let metadata = std::fs::metadata(&dir_path)?;
+        let current_mode = metadata.permissions().mode();
+        let new_mode = current_mode | settings.dir_mode;
+        std::fs::set_permissions(&dir_path, std::fs::Permissions::from_mode(new_mode))?;
+    }
+    
+    Ok(())
+}
+
+#[cfg(unix)]
+fn change_group(path: &Path, group: &str) -> Result<(), FileSystemError> {
+    use std::ffi::CString;
+    
+    let path_cstr = CString::new(path.to_string_lossy().as_bytes())
+        .map_err(|_| FileSystemError::InvalidPath { 
+            path: path.display().to_string() 
+        })?;
+    
+    // Look up group ID
+    let group_cstr = CString::new(group)
+        .map_err(|_| FileSystemError::InvalidPath { 
+            path: group.to_string() 
+        })?;
+    
+    unsafe {
+        let grp = libc::getgrnam(group_cstr.as_ptr());
+        if grp.is_null() {
+            return Err(FileSystemError::GroupNotFound { 
+                group: group.to_string() 
+            });
+        }
+        
+        let gid = (*grp).gr_gid;
+        if libc::chown(path_cstr.as_ptr(), u32::MAX, gid) != 0 {
+            return Err(FileSystemError::IoError {
+                path: path.display().to_string(),
+                source: std::io::Error::last_os_error(),
+            });
+        }
+    }
+    
+    Ok(())
+}
+
+#[cfg(windows)]
+fn set_windows_permissions(
+    file_paths: &[PathBuf],
+    local_root: &Path,
+    settings: &WindowsPermissionSettings,
+) -> Result<(), FileSystemError> {
+    // Windows ACL implementation using windows-sys
+    // Sets DACL entries for the specified user
+    todo!("Windows permission implementation")
+}
+```
+
+### Error Types Addition
+
+```rust
+// Add to FileSystemError enum
+#[error("Group not found: {group}")]
+GroupNotFound { group: String },
+
+#[error("Too many file conflicts for: {path}")]
+TooManyConflicts { path: String },
+```
+
+---
+
 ## Dependencies
 
 ```toml
@@ -789,6 +1705,11 @@ glob = "0.3"
 rayon = "1.8"
 thiserror = "1.0"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+lru = "0.12"
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 tempfile = "3.8"
@@ -801,29 +1722,42 @@ tempfile = "3.8"
 ### Phase 1: Core Infrastructure
 - [ ] Create `filesystem` crate structure
 - [ ] Implement `GlobFilter` with pattern matching
+- [ ] Implement path normalization utilities (POSIX conversion)
+- [ ] Implement `StatCache` for efficient filesystem access
 - [ ] Implement basic directory walker
 - [ ] Define error types
 
-### Phase 2: Snapshot Operation
+### Phase 2: Symlink Security
+- [ ] Implement `validate_symlink()` with security checks
+- [ ] Implement `open_file_secure()` with O_NOFOLLOW
+- [ ] Implement Windows path verification via GetFinalPathNameByHandleW
+- [ ] Add symlink categorization in scanner
+
+### Phase 3: Snapshot Operation
 - [ ] Implement `snapshot_structure()` (no hashing)
 - [ ] Implement parallel file hashing
 - [ ] Implement `snapshot()` with full hashing
 - [ ] Add symlink handling and validation
 - [ ] Add empty directory support (v2025)
 
-### Phase 3: Diff Operation
+### Phase 4: Diff Operation
 - [ ] Implement `diff()` with Fast mode
 - [ ] Implement `diff()` with Hash mode
 - [ ] Implement `create_diff_manifest()`
 - [ ] Add deletion marker generation
 
-### Phase 4: Optimizations
+### Phase 5: Optimizations
 - [ ] Hash cache integration
 - [ ] Glob pattern optimization (skip subtrees)
 - [ ] Memory-efficient large file handling
 - [ ] Progress reporting
 
-### Phase 5: Bindings
+### Phase 6: Platform Support
+- [ ] Windows long path handling (`\\?\` prefix)
+- [ ] File system permissions (POSIX)
+- [ ] File system permissions (Windows ACL)
+
+### Phase 7: Bindings
 - [ ] Python bindings via PyO3
 - [ ] WASM bindings via wasm-bindgen
 

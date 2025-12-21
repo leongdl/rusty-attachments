@@ -1131,3 +1131,456 @@ mod tests {
 
 - [model-design.md](model-design.md) - Core manifest model design
 - [storage-design.md](storage-design.md) - Storage abstraction for S3 operations
+
+---
+
+## Manifest Name Generation
+
+When uploading manifests to S3, a deterministic naming convention is used to identify manifests by their source root. This ensures consistent naming across uploads and enables manifest deduplication.
+
+### Naming Convention
+
+Manifest names follow the pattern: `{hash_of_source_root}_{suffix}`
+
+Where:
+- `hash_of_source_root`: XXH128 hash of the source root path string (as bytes)
+- `suffix`: Type identifier (e.g., `input`, `output`)
+
+Example: `a1b2c3d4e5f6789012345678901234567890_input`
+
+### Implementation
+
+```rust
+/// Generate a manifest file name from the source root path.
+/// 
+/// The name is deterministic based on the source root, allowing
+/// consistent naming across uploads from the same location.
+/// 
+/// # Arguments
+/// * `source_root` - The root path the manifest was created from
+/// * `suffix` - Type suffix (e.g., "input", "output")
+/// * `hash_alg` - Hash algorithm to use (typically XXH128)
+/// 
+/// # Returns
+/// Manifest name in format: `{hash}_{suffix}`
+/// 
+/// # Note
+/// The source_root is converted to a string using OS-specific separators
+/// before hashing. This means the same directory will produce different
+/// manifest names on Windows vs Unix. This is intentional - manifests
+/// from different OS types should be distinguishable.
+pub fn generate_manifest_name(
+    source_root: &str,
+    suffix: &str,
+    hash_alg: HashAlgorithm,
+) -> String {
+    let root_hash = hash_data(source_root.as_bytes(), hash_alg);
+    format!("{}_{}", root_hash, suffix)
+}
+
+/// Generate manifest name with hash algorithm from manifest.
+pub fn generate_manifest_name_from_manifest(
+    manifest: &Manifest,
+    source_root: &str,
+    suffix: &str,
+) -> String {
+    generate_manifest_name(source_root, suffix, manifest.hash_alg())
+}
+```
+
+### Full Manifest Key Construction
+
+The complete S3 key for a manifest combines the partial prefix with the generated name:
+
+```rust
+/// Build the full S3 key for an input manifest.
+/// 
+/// # Arguments
+/// * `root_prefix` - S3 root prefix (e.g., "DeadlineCloud")
+/// * `farm_id` - Farm identifier
+/// * `queue_id` - Queue identifier  
+/// * `guid` - Unique identifier for this upload session
+/// * `manifest_name` - Generated manifest name
+/// 
+/// # Returns
+/// Full S3 key: `{root_prefix}/Manifests/{farm_id}/{queue_id}/Inputs/{guid}/{manifest_name}`
+pub fn build_input_manifest_key(
+    root_prefix: &str,
+    farm_id: &str,
+    queue_id: &str,
+    guid: &str,
+    manifest_name: &str,
+) -> String {
+    format!(
+        "{}/Manifests/{}/{}/Inputs/{}/{}",
+        root_prefix, farm_id, queue_id, guid, manifest_name
+    )
+}
+
+/// Build the partial manifest key (excludes root prefix and Manifests folder).
+/// This is what gets stored in ManifestProperties.inputManifestPath.
+/// 
+/// # Returns
+/// Partial key: `{farm_id}/{queue_id}/Inputs/{guid}/{manifest_name}`
+pub fn build_partial_manifest_key(
+    farm_id: &str,
+    queue_id: &str,
+    guid: &str,
+    manifest_name: &str,
+) -> String {
+    format!(
+        "{}/{}/Inputs/{}/{}",
+        farm_id, queue_id, guid, manifest_name
+    )
+}
+```
+
+### Usage Example
+
+```rust
+use rusty_attachments_model::manifest_utils::{
+    generate_manifest_name, build_partial_manifest_key
+};
+use uuid::Uuid;
+
+// Generate manifest name from source root
+let source_root = "/mnt/projects/job1";
+let manifest_name = generate_manifest_name(source_root, "input", HashAlgorithm::Xxh128);
+// Result: "a1b2c3d4e5f6789012345678901234567890_input"
+
+// Build partial key for S3
+let guid = Uuid::new_v4().to_string();
+let partial_key = build_partial_manifest_key(
+    "farm-123",
+    "queue-456", 
+    &guid,
+    &manifest_name,
+);
+// Result: "farm-123/queue-456/Inputs/550e8400-e29b-41d4-a716-446655440000/a1b2c3d4..._input"
+```
+
+### Manifest Hash Computation
+
+After encoding a manifest, compute its hash for the `inputManifestHash` field:
+
+```rust
+/// Compute the hash of an encoded manifest.
+/// Used for ManifestProperties.inputManifestHash.
+pub fn compute_manifest_hash(manifest_bytes: &[u8], hash_alg: HashAlgorithm) -> String {
+    hash_data(manifest_bytes, hash_alg)
+}
+
+// Usage:
+let manifest_bytes = manifest.encode()?.as_bytes();
+let manifest_hash = compute_manifest_hash(manifest_bytes, manifest.hash_alg());
+```
+
+### Implementation Plan Addition
+
+Add to Phase 6:
+- [ ] Implement `generate_manifest_name()`
+- [ ] Implement `build_input_manifest_key()` and `build_partial_manifest_key()`
+- [ ] Implement `compute_manifest_hash()`
+- [ ] Unit tests for manifest naming
+
+
+---
+
+## Output File Detection
+
+When syncing outputs after job execution, we need to detect which files are new or modified since the input sync. This is done by tracking file modification times.
+
+### Synced Assets Mtime Tracker
+
+```rust
+/// Tracks modification times of synced assets.
+/// 
+/// Used to detect which files have been created or modified during job execution.
+/// Files are tracked by their absolute path, with mtime stored in nanoseconds.
+#[derive(Debug, Clone, Default)]
+pub struct SyncedAssetsMtime {
+    /// Map of absolute file path -> mtime in nanoseconds
+    mtimes: HashMap<String, i64>,
+}
+
+impl SyncedAssetsMtime {
+    /// Create a new empty tracker.
+    pub fn new() -> Self {
+        Self::default()
+    }
+    
+    /// Record the mtime of a file at sync time.
+    pub fn record(&mut self, path: &Path, mtime_ns: i64) {
+        self.mtimes.insert(path.to_string_lossy().into_owned(), mtime_ns);
+    }
+    
+    /// Record mtimes for all files in a manifest.
+    /// 
+    /// # Arguments
+    /// * `local_root` - Local root directory where files are synced
+    /// * `manifest` - The manifest containing file entries
+    pub fn record_from_manifest(&mut self, local_root: &Path, manifest: &Manifest) {
+        for file in manifest.files() {
+            if file.deleted {
+                continue;
+            }
+            let abs_path = local_root.join(&file.path);
+            if let Ok(metadata) = abs_path.metadata() {
+                if let Ok(mtime) = metadata.modified() {
+                    let mtime_ns = mtime
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_nanos() as i64)
+                        .unwrap_or(0);
+                    self.record(&abs_path, mtime_ns);
+                }
+            }
+        }
+    }
+    
+    /// Check if a file has been modified since it was synced.
+    /// 
+    /// Returns `true` if:
+    /// - The file was not tracked (new file)
+    /// - The file's current mtime is greater than the recorded mtime
+    pub fn is_modified(&self, path: &Path) -> bool {
+        let path_str = path.to_string_lossy();
+        match self.mtimes.get(path_str.as_ref()) {
+            None => true, // New file
+            Some(&recorded_mtime) => {
+                if let Ok(metadata) = path.metadata() {
+                    if let Ok(mtime) = metadata.modified() {
+                        let current_mtime_ns = mtime
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos() as i64)
+                            .unwrap_or(0);
+                        return current_mtime_ns > recorded_mtime;
+                    }
+                }
+                false
+            }
+        }
+    }
+    
+    /// Get the recorded mtime for a path, if any.
+    pub fn get_mtime(&self, path: &Path) -> Option<i64> {
+        self.mtimes.get(&path.to_string_lossy().into_owned()).copied()
+    }
+}
+```
+
+### Output File Discovery
+
+```rust
+/// Information about an output file discovered during sync.
+#[derive(Debug, Clone)]
+pub struct OutputFile {
+    /// File size in bytes
+    pub file_size: u64,
+    /// File hash (xxh128)
+    pub file_hash: String,
+    /// Relative path from local root (POSIX format)
+    pub rel_path: String,
+    /// Absolute path on local filesystem
+    pub full_path: PathBuf,
+    /// S3 key for CAS upload
+    pub s3_key: String,
+    /// Whether the file already exists in S3
+    pub in_s3: bool,
+}
+
+/// Discover output files in the specified directories.
+/// 
+/// Walks the output directories and finds files that are new or modified
+/// since the input sync (based on `synced_mtimes`).
+/// 
+/// # Arguments
+/// * `output_dirs` - Output directories to scan (relative to local_root)
+/// * `local_root` - Local root directory
+/// * `session_dir` - Session directory for security validation
+/// * `synced_mtimes` - Tracker with recorded mtimes from input sync
+/// * `hash_alg` - Hash algorithm to use
+/// * `cas_prefix` - S3 CAS prefix for key generation
+/// 
+/// # Returns
+/// List of output files with their metadata and hashes
+pub fn discover_output_files(
+    output_dirs: &[String],
+    local_root: &Path,
+    session_dir: &Path,
+    synced_mtimes: &SyncedAssetsMtime,
+    hash_alg: HashAlgorithm,
+    cas_prefix: &str,
+) -> Result<Vec<OutputFile>, FileSystemError> {
+    let mut output_files = Vec::new();
+    
+    for output_dir in output_dirs {
+        let output_root = local_root.join(output_dir);
+        
+        // Skip if directory doesn't exist (another task might create it)
+        if !output_root.is_dir() {
+            continue;
+        }
+        
+        // Walk the directory tree
+        for entry in walkdir::WalkDir::new(&output_root)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let file_path = entry.path();
+            
+            // Skip directories
+            if file_path.is_dir() {
+                continue;
+            }
+            
+            // Check if file is new or modified
+            if !synced_mtimes.is_modified(file_path) {
+                continue;
+            }
+            
+            // Security: resolve real path and validate within session directory
+            let real_path = file_path.canonicalize()
+                .map_err(|e| FileSystemError::IoError {
+                    path: file_path.display().to_string(),
+                    source: e,
+                })?;
+            
+            if !is_path_within_directory(&real_path, session_dir) {
+                // Skip files that resolve outside session directory
+                continue;
+            }
+            
+            // Get file metadata
+            let metadata = real_path.metadata()
+                .map_err(|e| FileSystemError::IoError {
+                    path: real_path.display().to_string(),
+                    source: e,
+                })?;
+            
+            let file_size = metadata.len();
+            
+            // Compute hash
+            let file_hash = hash_file(&real_path, hash_alg)?;
+            
+            // Build S3 key
+            let s3_key = format!("{}/{}.{}", cas_prefix, file_hash, hash_alg.extension());
+            
+            // Compute relative path (POSIX format)
+            let rel_path = file_path
+                .strip_prefix(local_root)
+                .map_err(|_| FileSystemError::PathOutsideRoot {
+                    path: file_path.display().to_string(),
+                    root: local_root.display().to_string(),
+                })?;
+            let rel_path_str = rel_path
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            
+            output_files.push(OutputFile {
+                file_size,
+                file_hash,
+                rel_path: rel_path_str,
+                full_path: real_path,
+                s3_key,
+                in_s3: false, // Caller should check S3 existence
+            });
+        }
+    }
+    
+    Ok(output_files)
+}
+
+/// Check if a path is within a directory (security validation).
+fn is_path_within_directory(file_path: &Path, directory_path: &Path) -> bool {
+    match (file_path.canonicalize(), directory_path.canonicalize()) {
+        (Ok(real_file), Ok(real_dir)) => real_file.starts_with(&real_dir),
+        _ => false,
+    }
+}
+```
+
+### Generate Output Manifest
+
+```rust
+/// Generate an output manifest from discovered output files.
+/// 
+/// # Arguments
+/// * `output_files` - List of output files discovered
+/// * `hash_alg` - Hash algorithm used
+/// 
+/// # Returns
+/// A manifest containing the output files
+pub fn generate_output_manifest(
+    output_files: &[OutputFile],
+    hash_alg: HashAlgorithm,
+) -> Manifest {
+    let paths: Vec<ManifestFilePath> = output_files
+        .iter()
+        .map(|file| {
+            let mtime_us = file.full_path
+                .metadata()
+                .and_then(|m| m.modified())
+                .map(|t| {
+                    t.duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| (d.as_nanos() / 1000) as i64)
+                        .unwrap_or(0)
+                })
+                .unwrap_or(0);
+            
+            ManifestFilePath::file(
+                &file.rel_path,
+                &file.file_hash,
+                file.file_size,
+                mtime_us,
+            )
+        })
+        .collect();
+    
+    let total_size: u64 = output_files.iter().map(|f| f.file_size).sum();
+    
+    Manifest::V2025_12_04_beta(AssetManifest {
+        hash_alg,
+        manifest_version: ManifestVersion::V2025_12_04_beta,
+        dirs: vec![],
+        paths,
+        total_size,
+        manifest_type: ManifestType::Snapshot,
+        parent_manifest_hash: None,
+    })
+}
+```
+
+### Usage Example
+
+```rust
+use rusty_attachments_model::manifest_utils::{
+    SyncedAssetsMtime, discover_output_files, generate_output_manifest,
+};
+
+// During input sync: record mtimes
+let mut synced_mtimes = SyncedAssetsMtime::new();
+for (local_root, manifest) in &merged_manifests_by_root {
+    synced_mtimes.record_from_manifest(Path::new(local_root), manifest);
+}
+
+// After job execution: discover output files
+let output_dirs = vec!["renders".to_string(), "cache".to_string()];
+let output_files = discover_output_files(
+    &output_dirs,
+    &local_root,
+    &session_dir,
+    &synced_mtimes,
+    HashAlgorithm::Xxh128,
+    "DeadlineCloud/Data",
+)?;
+
+// Generate output manifest
+if !output_files.is_empty() {
+    let output_manifest = generate_output_manifest(&output_files, HashAlgorithm::Xxh128);
+    
+    // Upload manifest and files...
+}
+```

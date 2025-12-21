@@ -141,6 +141,27 @@ pub struct StepOutputManifestPath {
     pub timestamp: f64,  // Seconds since epoch, converted to ISO 8601
 }
 
+/// Convert a float timestamp (seconds since epoch) to ISO 8601 format.
+/// 
+/// Format: `YYYY-MM-DDTHH:MM:SS.ffffffZ`
+/// Example: `2025-05-22T22:17:03.409012Z`
+/// 
+/// # Arguments
+/// * `timestamp` - Seconds since Unix epoch as f64
+/// 
+/// # Returns
+/// ISO 8601 formatted string with microsecond precision
+pub fn float_to_iso_datetime_string(timestamp: f64) -> String {
+    let seconds = timestamp.trunc() as i64;
+    let microseconds = ((timestamp.fract()) * 1_000_000.0) as u32;
+    
+    // Create datetime from timestamp
+    let dt = chrono::DateTime::from_timestamp(seconds, microseconds * 1000)
+        .unwrap_or_else(|| chrono::DateTime::UNIX_EPOCH);
+    
+    dt.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string()
+}
+
 /// Metadata returned when downloading a manifest
 #[derive(Debug, Clone)]
 pub struct ManifestDownloadMetadata {
@@ -150,6 +171,9 @@ pub struct ManifestDownloadMetadata {
     pub file_system_location_name: Option<String>,
     /// Content type from S3
     pub content_type: Option<String>,
+    /// S3 LastModified timestamp (seconds since epoch)
+    /// Used for chronological manifest merging
+    pub last_modified: Option<i64>,
 }
 
 /// Result of uploading a manifest
@@ -220,6 +244,257 @@ pub async fn download_input_manifest(
     location: &ManifestLocation,
     manifest_hash: &str,
 ) -> Result<(Manifest, ManifestDownloadMetadata), StorageError>;
+```
+
+---
+
+## Output Manifest Discovery
+
+Output manifests are stored in S3 with a hierarchical structure. To download job outputs, we need to discover which manifests exist. This section describes the primitives and composed functions for output manifest discovery.
+
+### Primitive: List S3 Objects
+
+```rust
+/// Information about an S3 object from list operations
+#[derive(Debug, Clone)]
+pub struct S3ObjectInfo {
+    pub key: String,
+    pub size: u64,
+    pub last_modified: i64,  // Unix timestamp (seconds)
+}
+
+/// List all objects under a prefix with pagination.
+/// This is a primitive operation that handles S3 pagination internally.
+pub async fn list_objects_with_prefix(
+    client: &impl StorageClient,
+    bucket: &str,
+    prefix: &str,
+) -> Result<Vec<S3ObjectInfo>, StorageError>;
+```
+
+### Primitive: Build Output Manifest Prefix
+
+```rust
+/// Scope for output manifest discovery
+#[derive(Debug, Clone)]
+pub enum OutputManifestScope {
+    /// All outputs for a job
+    Job { job_id: String },
+    /// All outputs for a step (includes all tasks)
+    Step { job_id: String, step_id: String },
+    /// All outputs for a specific task
+    Task { job_id: String, step_id: String, task_id: String },
+}
+
+/// Build the S3 prefix for listing output manifests.
+/// 
+/// Returns prefix like:
+/// - Job: `{root_prefix}/Manifests/{farm_id}/{queue_id}/{job_id}/`
+/// - Step: `{root_prefix}/Manifests/{farm_id}/{queue_id}/{job_id}/{step_id}/`
+/// - Task: `{root_prefix}/Manifests/{farm_id}/{queue_id}/{job_id}/{step_id}/{task_id}/`
+pub fn build_output_manifest_prefix(
+    location: &ManifestLocation,
+    scope: &OutputManifestScope,
+) -> String;
+```
+
+### Primitive: Filter Manifest Keys
+
+```rust
+/// Filter S3 keys to find output manifest files.
+/// 
+/// Output manifests match the pattern: `*_output` or `*_output.json`
+/// This filters out non-manifest files that may exist in the prefix.
+pub fn filter_output_manifest_keys(keys: &[S3ObjectInfo]) -> Vec<&S3ObjectInfo>;
+```
+
+### Primitive: Group Manifests by Task
+
+```rust
+/// Manifest key with parsed components
+#[derive(Debug, Clone)]
+pub struct ParsedManifestKey {
+    pub key: String,
+    pub last_modified: i64,
+    /// Task ID if this is a task-level manifest, None for step-level (chunked)
+    pub task_id: Option<String>,
+    /// The timestamp_sessionaction folder name (e.g., "2025-05-22T12:00:00.000000Z_sessionaction-xxx")
+    pub session_folder: String,
+}
+
+/// Parse manifest keys to extract task IDs and session folders.
+/// 
+/// Handles both:
+/// - Task-based: `.../step_id/task_id/timestamp_sessionaction/hash_output`
+/// - Chunked (step-level): `.../step_id/timestamp_sessionaction/hash_output`
+pub fn parse_manifest_keys(keys: &[S3ObjectInfo]) -> Vec<ParsedManifestKey>;
+
+/// Group parsed manifest keys by task ID.
+/// 
+/// Returns a map where:
+/// - Key is `Some(task_id)` for task-based manifests
+/// - Key is `None` for step-level (chunked) manifests
+pub fn group_manifests_by_task(
+    parsed_keys: &[ParsedManifestKey],
+) -> HashMap<Option<String>, Vec<&ParsedManifestKey>>;
+```
+
+### Primitive: Select Latest Per Task
+
+```rust
+/// Select the latest session action's manifests for each task.
+/// 
+/// For each task, keeps only manifests from the session folder with the
+/// latest `last_modified` timestamp. Step-level manifests (chunked steps)
+/// are always included.
+/// 
+/// # Why LastModified instead of folder name?
+/// The timestamp in the folder name comes from WorkerAgent and shouldn't be
+/// relied upon. S3's LastModified is authoritative.
+pub fn select_latest_manifests_per_task(
+    grouped: &HashMap<Option<String>, Vec<&ParsedManifestKey>>,
+) -> Vec<String>;  // Returns S3 keys
+```
+
+### Composed: Discover Output Manifest Keys
+
+```rust
+/// Options for output manifest discovery
+#[derive(Debug, Clone)]
+pub struct OutputManifestDiscoveryOptions {
+    /// Scope of discovery (job, step, or task)
+    pub scope: OutputManifestScope,
+    /// If true, select only the latest session action per task.
+    /// If false, return all manifests.
+    pub select_latest_per_task: bool,
+}
+
+/// Discover output manifest keys from S3.
+/// 
+/// This composed function:
+/// 1. Builds the S3 prefix for the given scope
+/// 2. Lists all objects under that prefix
+/// 3. Filters to only manifest files
+/// 4. Parses keys to extract task IDs and session folders
+/// 5. Optionally selects only the latest per task
+/// 
+/// # Example
+/// ```rust
+/// let options = OutputManifestDiscoveryOptions {
+///     scope: OutputManifestScope::Step {
+///         job_id: "job-123".into(),
+///         step_id: "step-456".into(),
+///     },
+///     select_latest_per_task: true,
+/// };
+/// 
+/// let manifest_keys = discover_output_manifest_keys(&client, &location, &options).await?;
+/// ```
+pub async fn discover_output_manifest_keys(
+    client: &impl StorageClient,
+    location: &ManifestLocation,
+    options: &OutputManifestDiscoveryOptions,
+) -> Result<Vec<String>, StorageError> {
+    // 1. Build prefix
+    let prefix = build_output_manifest_prefix(location, &options.scope);
+    
+    // 2. List objects
+    let objects = list_objects_with_prefix(client, &location.bucket, &prefix).await?;
+    
+    // 3. Filter to manifests
+    let manifest_objects = filter_output_manifest_keys(&objects);
+    
+    // 4. Parse keys
+    let parsed = parse_manifest_keys(manifest_objects);
+    
+    // 5. Select latest if requested
+    if options.select_latest_per_task {
+        let grouped = group_manifests_by_task(&parsed);
+        Ok(select_latest_manifests_per_task(&grouped))
+    } else {
+        Ok(parsed.iter().map(|p| p.key.clone()).collect())
+    }
+}
+```
+
+### Composed: Download Output Manifests by Asset Root
+
+```rust
+/// Downloaded manifest with metadata for merging
+#[derive(Debug, Clone)]
+pub struct DownloadedManifest {
+    pub manifest: Manifest,
+    pub asset_root: String,
+    pub last_modified: i64,
+}
+
+/// Download output manifests and group by asset root.
+/// 
+/// This composed function:
+/// 1. Discovers manifest keys using the given options
+/// 2. Downloads all manifests in parallel
+/// 3. Groups manifests by their asset root (from S3 metadata)
+/// 4. Merges manifests chronologically within each asset root
+/// 
+/// # Returns
+/// Map of asset_root -> merged manifest
+pub async fn download_output_manifests_by_asset_root(
+    client: &impl StorageClient,
+    location: &ManifestLocation,
+    options: &OutputManifestDiscoveryOptions,
+) -> Result<HashMap<String, Manifest>, StorageError> {
+    // 1. Discover manifest keys
+    let keys = discover_output_manifest_keys(client, location, options).await?;
+    
+    // 2. Download all manifests in parallel
+    let downloaded: Vec<DownloadedManifest> = download_manifests_parallel(client, &location.bucket, &keys).await?;
+    
+    // 3. Group by asset root
+    let mut by_root: HashMap<String, Vec<DownloadedManifest>> = HashMap::new();
+    for dm in downloaded {
+        by_root.entry(dm.asset_root.clone()).or_default().push(dm);
+    }
+    
+    // 4. Merge chronologically within each root
+    let mut result = HashMap::new();
+    for (root, manifests) in by_root {
+        let merged = merge_manifests_chronologically(manifests)?;
+        if let Some(m) = merged {
+            result.insert(root, m);
+        }
+    }
+    
+    Ok(result)
+}
+
+/// Download multiple manifests in parallel.
+async fn download_manifests_parallel(
+    client: &impl StorageClient,
+    bucket: &str,
+    keys: &[String],
+) -> Result<Vec<DownloadedManifest>, StorageError>;
+```
+
+### Session Action ID Lookup
+
+```rust
+/// Find manifests for a specific session action ID.
+/// 
+/// When the session action ID is known (e.g., from GetTask API), we can
+/// search for manifests containing that ID in their path. This is more
+/// reliable than timestamp-based selection.
+/// 
+/// # Search Strategy
+/// 1. First searches in task folder (`.../step_id/task_id/`)
+/// 2. Falls back to step folder (`.../step_id/`) for chunked steps
+pub async fn find_manifests_by_session_action_id(
+    client: &impl StorageClient,
+    location: &ManifestLocation,
+    job_id: &str,
+    step_id: &str,
+    task_id: &str,
+    session_action_id: &str,
+) -> Result<Vec<String>, StorageError>;
 ```
 
 ---
