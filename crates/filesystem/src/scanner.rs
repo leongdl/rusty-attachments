@@ -769,4 +769,328 @@ mod tests {
         // Should have 3 files + 1 symlink
         assert_eq!(manifest.file_count(), 4);
     }
+
+    // ==================== Glob escaping integration tests ====================
+
+    #[test]
+    fn test_snapshot_with_brackets_in_directory_name() {
+        use crate::glob::escape_glob;
+
+        let dir: TempDir = TempDir::new().unwrap();
+
+        // Create directories with brackets in their names
+        std::fs::create_dir(dir.path().join("output[v1]")).unwrap();
+        std::fs::create_dir(dir.path().join("output[v2]")).unwrap();
+        std::fs::create_dir(dir.path().join("normal")).unwrap();
+
+        // Create files in each directory
+        std::fs::File::create(dir.path().join("output[v1]/file1.txt")).unwrap();
+        std::fs::File::create(dir.path().join("output[v1]/file2.txt")).unwrap();
+        std::fs::File::create(dir.path().join("output[v2]/file3.txt")).unwrap();
+        std::fs::File::create(dir.path().join("normal/file4.txt")).unwrap();
+
+        // Use escaped pattern to match only output[v1]
+        let pattern: String = format!("{}/**", escape_glob("output[v1]"));
+        let filter: GlobFilter = GlobFilter::include(vec![pattern]).unwrap();
+
+        let scanner: FileSystemScanner = FileSystemScanner::new();
+        let options: SnapshotOptions = SnapshotOptions {
+            root: dir.path().to_path_buf(),
+            filter,
+            ..Default::default()
+        };
+
+        let manifest: Manifest = scanner.snapshot(&options, None).unwrap();
+
+        // Should only include files from output[v1]
+        assert_eq!(manifest.file_count(), 2);
+
+        // Verify the paths
+        let paths: Vec<String> = match manifest {
+            Manifest::V2023_03_03(m) => m.paths.iter().map(|p| p.path.clone()).collect(),
+            Manifest::V2025_12_04_beta(m) => m.paths.iter().map(|p| p.path.clone()).collect(),
+        };
+        assert!(paths.contains(&"output[v1]/file1.txt".to_string()));
+        assert!(paths.contains(&"output[v1]/file2.txt".to_string()));
+    }
+
+    #[test]
+    fn test_snapshot_with_asterisk_in_directory_name() {
+        use crate::glob::escape_glob;
+
+        let dir: TempDir = TempDir::new().unwrap();
+
+        // Create directories with asterisks in their names
+        std::fs::create_dir(dir.path().join("cache*temp")).unwrap();
+        std::fs::create_dir(dir.path().join("cache_temp")).unwrap();
+
+        std::fs::File::create(dir.path().join("cache*temp/data1.bin")).unwrap();
+        std::fs::File::create(dir.path().join("cache_temp/data2.bin")).unwrap();
+
+        // Use escaped pattern to match only the literal "cache*temp"
+        let pattern: String = format!("{}/**", escape_glob("cache*temp"));
+        let filter: GlobFilter = GlobFilter::include(vec![pattern]).unwrap();
+
+        let scanner: FileSystemScanner = FileSystemScanner::new();
+        let options: SnapshotOptions = SnapshotOptions {
+            root: dir.path().to_path_buf(),
+            filter,
+            ..Default::default()
+        };
+
+        let manifest: Manifest = scanner.snapshot(&options, None).unwrap();
+
+        // Should only include files from cache*temp (literal)
+        assert_eq!(manifest.file_count(), 1);
+
+        let paths: Vec<String> = match manifest {
+            Manifest::V2023_03_03(m) => m.paths.iter().map(|p| p.path.clone()).collect(),
+            Manifest::V2025_12_04_beta(m) => m.paths.iter().map(|p| p.path.clone()).collect(),
+        };
+        assert!(paths.contains(&"cache*temp/data1.bin".to_string()));
+    }
+
+    #[test]
+    fn test_snapshot_with_question_mark_in_directory_name() {
+        use crate::glob::escape_glob;
+
+        let dir: TempDir = TempDir::new().unwrap();
+
+        // Create directories with question marks in their names
+        std::fs::create_dir(dir.path().join("logs?debug")).unwrap();
+        std::fs::create_dir(dir.path().join("logs_debug")).unwrap();
+
+        std::fs::File::create(dir.path().join("logs?debug/output.log")).unwrap();
+        std::fs::File::create(dir.path().join("logs_debug/output.log")).unwrap();
+
+        // Use escaped pattern to match only the literal "logs?debug"
+        let pattern: String = format!("{}/**", escape_glob("logs?debug"));
+        let filter: GlobFilter = GlobFilter::include(vec![pattern]).unwrap();
+
+        let scanner: FileSystemScanner = FileSystemScanner::new();
+        let options: SnapshotOptions = SnapshotOptions {
+            root: dir.path().to_path_buf(),
+            filter,
+            ..Default::default()
+        };
+
+        let manifest: Manifest = scanner.snapshot(&options, None).unwrap();
+
+        // Should only include files from logs?debug (literal)
+        assert_eq!(manifest.file_count(), 1);
+
+        let paths: Vec<String> = match manifest {
+            Manifest::V2023_03_03(m) => m.paths.iter().map(|p| p.path.clone()).collect(),
+            Manifest::V2025_12_04_beta(m) => m.paths.iter().map(|p| p.path.clone()).collect(),
+        };
+        assert!(paths.contains(&"logs?debug/output.log".to_string()));
+    }
+
+    #[test]
+    fn test_snapshot_with_braces_in_directory_name() {
+        use crate::glob::escape_glob;
+
+        let dir: TempDir = TempDir::new().unwrap();
+
+        // Create directories with braces in their names
+        std::fs::create_dir(dir.path().join("config{prod}")).unwrap();
+        std::fs::create_dir(dir.path().join("config_prod")).unwrap();
+
+        std::fs::File::create(dir.path().join("config{prod}/settings.json")).unwrap();
+        std::fs::File::create(dir.path().join("config_prod/settings.json")).unwrap();
+
+        // Use escaped pattern to match only the literal "config{prod}"
+        let pattern: String = format!("{}/**", escape_glob("config{prod}"));
+        let filter: GlobFilter = GlobFilter::include(vec![pattern]).unwrap();
+
+        let scanner: FileSystemScanner = FileSystemScanner::new();
+        let options: SnapshotOptions = SnapshotOptions {
+            root: dir.path().to_path_buf(),
+            filter,
+            ..Default::default()
+        };
+
+        let manifest: Manifest = scanner.snapshot(&options, None).unwrap();
+
+        // Should only include files from config{prod} (literal)
+        assert_eq!(manifest.file_count(), 1);
+
+        let paths: Vec<String> = match manifest {
+            Manifest::V2023_03_03(m) => m.paths.iter().map(|p| p.path.clone()).collect(),
+            Manifest::V2025_12_04_beta(m) => m.paths.iter().map(|p| p.path.clone()).collect(),
+        };
+        assert!(paths.contains(&"config{prod}/settings.json".to_string()));
+    }
+
+    #[test]
+    fn test_snapshot_multiple_escaped_directories() {
+        use crate::glob::escape_glob;
+
+        let dir: TempDir = TempDir::new().unwrap();
+
+        // Create multiple directories with special characters
+        std::fs::create_dir(dir.path().join("renders[final]")).unwrap();
+        std::fs::create_dir(dir.path().join("cache*temp")).unwrap();
+        std::fs::create_dir(dir.path().join("logs?debug")).unwrap();
+        std::fs::create_dir(dir.path().join("other")).unwrap();
+
+        std::fs::File::create(dir.path().join("renders[final]/image.png")).unwrap();
+        std::fs::File::create(dir.path().join("cache*temp/data.bin")).unwrap();
+        std::fs::File::create(dir.path().join("logs?debug/output.log")).unwrap();
+        std::fs::File::create(dir.path().join("other/file.txt")).unwrap();
+
+        // Simulate the Python pattern: include=[glob.escape(subdir) + "/**" for subdir in output_dirs]
+        let output_dirs: Vec<&str> = vec!["renders[final]", "cache*temp", "logs?debug"];
+        let patterns: Vec<String> = output_dirs
+            .iter()
+            .map(|dir| format!("{}/**", escape_glob(dir)))
+            .collect();
+
+        let filter: GlobFilter = GlobFilter::include(patterns).unwrap();
+
+        let scanner: FileSystemScanner = FileSystemScanner::new();
+        let options: SnapshotOptions = SnapshotOptions {
+            root: dir.path().to_path_buf(),
+            filter,
+            ..Default::default()
+        };
+
+        let manifest: Manifest = scanner.snapshot(&options, None).unwrap();
+
+        // Should include files from all three escaped directories, but not "other"
+        assert_eq!(manifest.file_count(), 3);
+
+        let paths: Vec<String> = match manifest {
+            Manifest::V2023_03_03(m) => m.paths.iter().map(|p| p.path.clone()).collect(),
+            Manifest::V2025_12_04_beta(m) => m.paths.iter().map(|p| p.path.clone()).collect(),
+        };
+        assert!(paths.contains(&"renders[final]/image.png".to_string()));
+        assert!(paths.contains(&"cache*temp/data.bin".to_string()));
+        assert!(paths.contains(&"logs?debug/output.log".to_string()));
+        assert!(!paths.iter().any(|p| p.contains("other")));
+    }
+
+    #[test]
+    fn test_snapshot_escaped_vs_unescaped_comparison() {
+        use crate::glob::escape_glob;
+
+        let dir: TempDir = TempDir::new().unwrap();
+
+        // Create directories that would match unescaped pattern
+        std::fs::create_dir(dir.path().join("file[1]")).unwrap();
+        std::fs::create_dir(dir.path().join("file1")).unwrap();
+
+        std::fs::File::create(dir.path().join("file[1]/data.txt")).unwrap();
+        std::fs::File::create(dir.path().join("file1/data.txt")).unwrap();
+
+        // Test 1: Unescaped pattern - [1] is a character class matching '1'
+        let unescaped_filter: GlobFilter =
+            GlobFilter::include(vec!["file[1]/**".to_string()]).unwrap();
+
+        let scanner: FileSystemScanner = FileSystemScanner::new();
+        let options_unescaped: SnapshotOptions = SnapshotOptions {
+            root: dir.path().to_path_buf(),
+            filter: unescaped_filter,
+            ..Default::default()
+        };
+
+        let manifest_unescaped: Manifest = scanner.snapshot(&options_unescaped, None).unwrap();
+
+        // Unescaped should match "file1" (character class)
+        assert_eq!(manifest_unescaped.file_count(), 1);
+        let paths_unescaped: Vec<String> = match manifest_unescaped {
+            Manifest::V2023_03_03(m) => m.paths.iter().map(|p| p.path.clone()).collect(),
+            Manifest::V2025_12_04_beta(m) => m.paths.iter().map(|p| p.path.clone()).collect(),
+        };
+        assert!(paths_unescaped.contains(&"file1/data.txt".to_string()));
+
+        // Test 2: Escaped pattern - literal brackets
+        let escaped_pattern: String = format!("{}/**", escape_glob("file[1]"));
+        let escaped_filter: GlobFilter = GlobFilter::include(vec![escaped_pattern]).unwrap();
+
+        let options_escaped: SnapshotOptions = SnapshotOptions {
+            root: dir.path().to_path_buf(),
+            filter: escaped_filter,
+            ..Default::default()
+        };
+
+        let manifest_escaped: Manifest = scanner.snapshot(&options_escaped, None).unwrap();
+
+        // Escaped should match "file[1]" (literal)
+        assert_eq!(manifest_escaped.file_count(), 1);
+        let paths_escaped: Vec<String> = match manifest_escaped {
+            Manifest::V2023_03_03(m) => m.paths.iter().map(|p| p.path.clone()).collect(),
+            Manifest::V2025_12_04_beta(m) => m.paths.iter().map(|p| p.path.clone()).collect(),
+        };
+        assert!(paths_escaped.contains(&"file[1]/data.txt".to_string()));
+    }
+
+    #[test]
+    fn test_snapshot_with_exclamation_in_directory_name() {
+        use crate::glob::escape_glob;
+
+        let dir: TempDir = TempDir::new().unwrap();
+
+        // Create directories with exclamation marks in their names
+        std::fs::create_dir(dir.path().join("important!")).unwrap();
+        std::fs::create_dir(dir.path().join("important")).unwrap();
+
+        std::fs::File::create(dir.path().join("important!/file.txt")).unwrap();
+        std::fs::File::create(dir.path().join("important/file.txt")).unwrap();
+
+        // Use escaped pattern to match only the literal "important!"
+        let pattern: String = format!("{}/**", escape_glob("important!"));
+        let filter: GlobFilter = GlobFilter::include(vec![pattern]).unwrap();
+
+        let scanner: FileSystemScanner = FileSystemScanner::new();
+        let options: SnapshotOptions = SnapshotOptions {
+            root: dir.path().to_path_buf(),
+            filter,
+            ..Default::default()
+        };
+
+        let manifest: Manifest = scanner.snapshot(&options, None).unwrap();
+
+        // Should only include files from important! (literal)
+        assert_eq!(manifest.file_count(), 1);
+
+        let paths: Vec<String> = match manifest {
+            Manifest::V2023_03_03(m) => m.paths.iter().map(|p| p.path.clone()).collect(),
+            Manifest::V2025_12_04_beta(m) => m.paths.iter().map(|p| p.path.clone()).collect(),
+        };
+        assert!(paths.contains(&"important!/file.txt".to_string()));
+    }
+
+    #[test]
+    fn test_snapshot_with_mixed_special_characters() {
+        use crate::glob::escape_glob;
+
+        let dir: TempDir = TempDir::new().unwrap();
+
+        // Create a directory with multiple special characters
+        std::fs::create_dir(dir.path().join("test[*?{!}]")).unwrap();
+        std::fs::File::create(dir.path().join("test[*?{!}]/data.txt")).unwrap();
+
+        // Use escaped pattern
+        let pattern: String = format!("{}/**", escape_glob("test[*?{!}]"));
+        let filter: GlobFilter = GlobFilter::include(vec![pattern]).unwrap();
+
+        let scanner: FileSystemScanner = FileSystemScanner::new();
+        let options: SnapshotOptions = SnapshotOptions {
+            root: dir.path().to_path_buf(),
+            filter,
+            ..Default::default()
+        };
+
+        let manifest: Manifest = scanner.snapshot(&options, None).unwrap();
+
+        // Should match the literal directory name
+        assert_eq!(manifest.file_count(), 1);
+
+        let paths: Vec<String> = match manifest {
+            Manifest::V2023_03_03(m) => m.paths.iter().map(|p| p.path.clone()).collect(),
+            Manifest::V2025_12_04_beta(m) => m.paths.iter().map(|p| p.path.clone()).collect(),
+        };
+        assert!(paths.contains(&"test[*?{!}]/data.txt".to_string()));
+    }
 }

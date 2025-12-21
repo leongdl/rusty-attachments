@@ -54,21 +54,21 @@ Directory scanning and manifest creation.
 
 ## Phase 4: Caching Layer
 
-**Location:** `storage` crate
+**Location:** `storage` crate ✅ COMPLETE
 
 ### 4a. Hash Cache
 
-- [ ] `HashCacheBackend` trait
-- [ ] `HashCacheKey`, `HashCacheEntry` structs
-- [ ] `SqliteHashCache` implementation
-- [ ] `HashCache` wrapper with TTL
+- [x] `HashCacheBackend` trait
+- [x] `HashCacheKey`, `HashCacheEntry` structs
+- [x] `HashCache` wrapper with TTL
+- [x] `SqliteHashCache` implementation
 
 ### 4b. S3 Check Cache
 
-- [ ] `S3CheckCacheBackend` trait
-- [ ] `S3CheckCacheKey`, `S3CheckCacheEntry` structs
-- [ ] `SqliteS3CheckCache` implementation
-- [ ] `S3CheckCache` wrapper with integrity verification
+- [x] `S3CheckCacheBackend` trait
+- [x] `S3CheckCacheKey`, `S3CheckCacheEntry` structs
+- [x] `S3CheckCache` wrapper with integrity verification
+- [x] `SqliteS3CheckCache` implementation
 
 ---
 
