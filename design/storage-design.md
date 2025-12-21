@@ -637,6 +637,59 @@ impl<C: StorageClient> DownloadOrchestrator<C> {
         progress: Option<&dyn ProgressCallback>,
     ) -> Result<TransferStatistics, StorageError>;
     
+    /// Download files to pre-resolved absolute paths.
+    /// 
+    /// Unlike `download_manifest()` which joins manifest paths with a root,
+    /// this takes paths that are already resolved to absolute local destinations.
+    /// This is useful for:
+    /// - Cross-storage-profile downloads where paths have been mapped
+    /// - Incremental downloads where paths come from multiple manifests
+    /// - Custom download destinations
+    /// 
+    /// # Arguments
+    /// * `files` - Pre-resolved paths from `resolve_manifest_paths()`
+    /// * `hash_algorithm` - Hash algorithm used by the manifest
+    /// * `conflict_resolution` - How to handle existing files
+    /// * `progress` - Optional progress callback
+    /// 
+    /// # Example
+    /// ```
+    /// use rusty_attachments_storage::{
+    ///     DownloadOrchestrator, ConflictResolution,
+    ///     path_mapping::{resolve_manifest_paths, PathMappingApplier, PathFormat},
+    /// };
+    /// 
+    /// // Download manifest and resolve paths with mapping
+    /// let (manifest, metadata) = download_manifest(&client, bucket, key).await?;
+    /// let applier = PathMappingApplier::new(&rules)?;
+    /// let resolved = resolve_manifest_paths(
+    ///     &manifest,
+    ///     &metadata.asset_root,
+    ///     PathFormat::Windows,
+    ///     Some(&applier),
+    /// )?;
+    /// 
+    /// // Download to resolved paths
+    /// let stats = orchestrator.download_to_resolved_paths(
+    ///     &resolved.resolved,
+    ///     manifest.hash_alg(),
+    ///     ConflictResolution::CreateCopy,
+    ///     Some(&progress_callback),
+    /// ).await?;
+    /// 
+    /// // Handle unmapped paths
+    /// for unmapped in &resolved.unmapped {
+    ///     eprintln!("Skipped (no mapping): {}", unmapped.absolute_source_path);
+    /// }
+    /// ```
+    pub async fn download_to_resolved_paths(
+        &self,
+        files: &[ResolvedManifestPath],
+        hash_algorithm: HashAlgorithm,
+        conflict_resolution: ConflictResolution,
+        progress: Option<&dyn ProgressCallback<TransferProgress>>,
+    ) -> Result<TransferStatistics, StorageError>;
+    
     /// Download a single file from CAS
     pub async fn download_file(
         &self,
@@ -1193,6 +1246,8 @@ impl<C: StorageClient> UploadOrchestrator<C> {
 ### Download Business Logic Example
 
 ```rust
+use crate::path_mapping::ResolvedManifestPath;
+
 impl<C: StorageClient> DownloadOrchestrator<C> {
     /// Download all files from a manifest to local filesystem
     pub async fn download_manifest(
@@ -1233,6 +1288,168 @@ impl<C: StorageClient> DownloadOrchestrator<C> {
         }
         
         Ok(stats)
+    }
+    
+    /// Download files to pre-resolved absolute paths.
+    /// 
+    /// This is the core download function for cross-storage-profile downloads
+    /// and incremental download scenarios where paths have already been resolved
+    /// and mapped to local destinations.
+    pub async fn download_to_resolved_paths(
+        &self,
+        files: &[ResolvedManifestPath],
+        hash_algorithm: HashAlgorithm,
+        conflict_resolution: ConflictResolution,
+        progress: Option<&dyn ProgressCallback<TransferProgress>>,
+    ) -> Result<TransferStatistics, StorageError> {
+        let mut stats = TransferStatistics::default();
+        let total_files = files.len() as u64;
+        let total_bytes: u64 = files.iter()
+            .filter_map(|f| f.manifest_entry.size)
+            .sum();
+        
+        for (index, resolved) in files.iter().enumerate() {
+            let entry = &resolved.manifest_entry;
+            let local_path = &resolved.local_path;
+            
+            // Report progress
+            if let Some(cb) = progress {
+                let progress_update = TransferProgress {
+                    status: ProgressStatus::DownloadInProgress,
+                    operation: OperationType::Downloading,
+                    current_key: local_path.display().to_string(),
+                    current_bytes: 0,
+                    current_total: entry.size.unwrap_or(0),
+                    overall_completed: index as u64,
+                    overall_total: total_files,
+                    overall_bytes: stats.bytes_transferred,
+                    overall_total_bytes: total_bytes,
+                };
+                if !cb.on_progress(&progress_update) {
+                    return Err(StorageError::Cancelled {
+                        partial_stats: SummaryStatistics::from(&stats),
+                    });
+                }
+            }
+            
+            // Skip deleted entries
+            if entry.deleted {
+                continue;
+            }
+            
+            // Handle symlinks
+            if let Some(ref target) = entry.symlink_target {
+                self.create_symlink(local_path, target)?;
+                stats.files_processed += 1;
+                continue;
+            }
+            
+            // Handle conflict resolution
+            let final_path = if local_path.exists() {
+                match conflict_resolution {
+                    ConflictResolution::Skip => {
+                        stats.files_skipped += 1;
+                        stats.bytes_skipped += entry.size.unwrap_or(0);
+                        continue;
+                    }
+                    ConflictResolution::Overwrite => local_path.clone(),
+                    ConflictResolution::CreateCopy => {
+                        download_logic::generate_unique_copy_path(local_path)?
+                    }
+                }
+            } else {
+                local_path.clone()
+            };
+            
+            // Create parent directories
+            if let Some(parent) = final_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            
+            let size = entry.size.unwrap_or(0);
+            
+            // Download based on entry type
+            if let Some(ref hash) = entry.hash {
+                // Single file download
+                let s3_key = self.location.cas_key(hash, hash_algorithm);
+                self.client.get_object_to_file(
+                    &self.location.bucket,
+                    &s3_key,
+                    &final_path.to_string_lossy(),
+                    progress,
+                ).await?;
+            } else if let Some(ref chunkhashes) = entry.chunkhashes {
+                // Chunked file download - reassemble from chunks
+                let chunks = upload_logic::generate_chunks(size, CHUNK_SIZE_V2);
+                for (chunk, hash) in chunks.iter().zip(chunkhashes.iter()) {
+                    let s3_key = self.location.cas_key(hash, hash_algorithm);
+                    self.client.get_object_to_file_offset(
+                        &self.location.bucket,
+                        &s3_key,
+                        &final_path.to_string_lossy(),
+                        chunk.offset,
+                        progress,
+                    ).await?;
+                }
+            } else {
+                return Err(StorageError::Other {
+                    message: format!("Entry {} has no hash or chunkhashes", entry.path),
+                });
+            }
+            
+            // Set mtime
+            if let Some(mtime) = entry.mtime {
+                set_file_mtime(&final_path, mtime)?;
+            }
+            
+            // Set executable bit
+            #[cfg(unix)]
+            if entry.runnable {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = std::fs::metadata(&final_path)?.permissions();
+                perms.set_mode(perms.mode() | 0o111);
+                std::fs::set_permissions(&final_path, perms)?;
+            }
+            
+            stats.files_processed += 1;
+            stats.files_transferred += 1;
+            stats.bytes_transferred += size;
+        }
+        
+        Ok(stats)
+    }
+    
+    /// Create a symlink at the given path.
+    fn create_symlink(&self, link_path: &Path, target: &str) -> Result<(), StorageError> {
+        // Create parent directories
+        if let Some(parent) = link_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| StorageError::IoError {
+                path: parent.display().to_string(),
+                message: e.to_string(),
+            })?;
+        }
+        
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link_path).map_err(|e| StorageError::IoError {
+                path: link_path.display().to_string(),
+                message: e.to_string(),
+            })?;
+        }
+        
+        #[cfg(windows)]
+        {
+            // On Windows, we need to determine if target is a file or directory
+            // For simplicity, try file first, then directory
+            if std::os::windows::fs::symlink_file(target, link_path).is_err() {
+                std::os::windows::fs::symlink_dir(target, link_path).map_err(|e| StorageError::IoError {
+                    path: link_path.display().to_string(),
+                    message: e.to_string(),
+                })?;
+            }
+        }
+        
+        Ok(())
     }
     
     /// Download a v2 file entry

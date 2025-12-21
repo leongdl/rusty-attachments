@@ -333,6 +333,379 @@ pub fn convert_output_dir_path(
 
 ---
 
+## Path Mapping Applier
+
+For efficient batch path transformation, we provide a trie-based applier that matches paths against multiple rules in O(path_depth) time.
+
+### Why a Trie?
+
+When transforming many paths (e.g., all files in a manifest), checking each path against each rule is O(paths × rules × path_length). A trie reduces this to O(paths × path_depth), which is significant when:
+- Many rules exist (multiple file system locations)
+- Many paths need transformation (large manifests)
+
+### Implementation
+
+```rust
+use std::collections::HashMap;
+use std::path::{Path, PathBuf, PurePosixPath, PureWindowsPath};
+
+/// Trie node for path mapping.
+struct TrieNode {
+    /// Destination path if this node represents a complete rule.
+    destination: Option<PathBuf>,
+    /// Child nodes keyed by path component.
+    children: HashMap<String, TrieNode>,
+}
+
+impl TrieNode {
+    fn new() -> Self {
+        Self {
+            destination: None,
+            children: HashMap::new(),
+        }
+    }
+}
+
+/// Efficient path mapper using trie for rule matching.
+/// 
+/// Handles case-insensitive matching for Windows source paths while
+/// preserving case in the output.
+/// 
+/// # Algorithm
+/// 
+/// 1. Each source path is split into components using the appropriate
+///    path parser (PureWindowsPath or PurePosixPath).
+/// 2. Components are inserted into a trie, with the destination stored
+///    at the terminal node.
+/// 3. When transforming a path, we traverse the trie matching components.
+///    The longest matching prefix wins.
+/// 4. Remaining path components are appended to the destination.
+/// 
+/// # Example
+/// ```
+/// use rusty_attachments_storage::path_mapping::{PathMappingRule, PathMappingApplier, PathFormat};
+/// 
+/// let rules = vec![
+///     PathMappingRule::new(PathFormat::Windows, r"Z:\Projects", "/mnt/projects"),
+///     PathMappingRule::new(PathFormat::Windows, r"Z:\Projects\Special", "/mnt/special"),
+/// ];
+/// 
+/// let applier = PathMappingApplier::new(&rules)?;
+/// 
+/// // Most specific rule wins
+/// assert_eq!(
+///     applier.transform(r"Z:\Projects\Special\data.txt"),
+///     Some(PathBuf::from("/mnt/special/data.txt"))
+/// );
+/// 
+/// // Less specific rule for other paths
+/// assert_eq!(
+///     applier.transform(r"Z:\Projects\Other\file.txt"),
+///     Some(PathBuf::from("/mnt/projects/Other/file.txt"))
+/// );
+/// 
+/// // Case-insensitive matching for Windows
+/// assert_eq!(
+///     applier.transform(r"z:\projects\other\file.txt"),
+///     Some(PathBuf::from("/mnt/projects/other/file.txt"))
+/// );
+/// ```
+pub struct PathMappingApplier {
+    /// Source path format (determines parsing and case sensitivity).
+    source_path_format: PathFormat,
+    /// Root of the trie.
+    trie: TrieNode,
+}
+
+impl PathMappingApplier {
+    /// Create a new path mapping applier from a list of rules.
+    /// 
+    /// # Errors
+    /// Returns error if rules have inconsistent source path formats.
+    pub fn new(rules: &[PathMappingRule]) -> Result<Self, PathMappingError> {
+        if rules.is_empty() {
+            return Ok(Self {
+                source_path_format: PathFormat::Posix,
+                trie: TrieNode::new(),
+            });
+        }
+        
+        let source_path_format = rules[0].source_path_format;
+        
+        // Verify all rules have the same source format
+        for rule in rules.iter().skip(1) {
+            if rule.source_path_format != source_path_format {
+                return Err(PathMappingError::InconsistentSourceFormats {
+                    expected: source_path_format,
+                    found: rule.source_path_format,
+                });
+            }
+        }
+        
+        let mut trie = TrieNode::new();
+        
+        for rule in rules {
+            let parts = Self::split_path(&rule.source_path, source_path_format);
+            let mut node = &mut trie;
+            
+            for part in parts {
+                let key = Self::normalize_part(&part, source_path_format);
+                node = node.children.entry(key).or_insert_with(TrieNode::new);
+            }
+            
+            node.destination = Some(PathBuf::from(&rule.destination_path));
+        }
+        
+        Ok(Self { source_path_format, trie })
+    }
+    
+    /// Transform a path using the mapping rules.
+    /// 
+    /// Returns `None` if no rule matches the path.
+    pub fn transform(&self, path: &str) -> Option<PathBuf> {
+        let parts = Self::split_path(path, self.source_path_format);
+        
+        let mut matched_destination: Option<&PathBuf> = None;
+        let mut matched_remaining_start: usize = 0;
+        
+        let mut node = &self.trie;
+        
+        for (i, part) in parts.iter().enumerate() {
+            let key = Self::normalize_part(part, self.source_path_format);
+            
+            match node.children.get(&key) {
+                Some(child) => {
+                    // Record match if this node has a destination
+                    if child.destination.is_some() {
+                        matched_destination = child.destination.as_ref();
+                        matched_remaining_start = i + 1;
+                    }
+                    node = child;
+                }
+                None => break,
+            }
+        }
+        
+        matched_destination.map(|dest| {
+            let remaining: Vec<&str> = parts[matched_remaining_start..].iter()
+                .map(|s| s.as_str())
+                .collect();
+            
+            if remaining.is_empty() {
+                dest.clone()
+            } else {
+                dest.join(remaining.join("/"))
+            }
+        })
+    }
+    
+    /// Transform a path, returning an error if no rule matches.
+    pub fn strict_transform(&self, path: &str) -> Result<PathBuf, PathMappingError> {
+        self.transform(path).ok_or_else(|| PathMappingError::NoRuleMatched {
+            path: path.to_string(),
+        })
+    }
+    
+    /// Get the source path format for this applier.
+    pub fn source_path_format(&self) -> PathFormat {
+        self.source_path_format
+    }
+    
+    /// Split a path into components using the appropriate parser.
+    fn split_path(path: &str, format: PathFormat) -> Vec<String> {
+        match format {
+            PathFormat::Windows => {
+                // Use a simple split that handles both \ and /
+                path.replace('/', "\\")
+                    .split('\\')
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect()
+            }
+            PathFormat::Posix => {
+                path.split('/')
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect()
+            }
+        }
+    }
+    
+    /// Normalize a path component for trie lookup.
+    /// Windows paths are case-insensitive, POSIX are case-sensitive.
+    fn normalize_part(part: &str, format: PathFormat) -> String {
+        match format {
+            PathFormat::Windows => part.to_lowercase(),
+            PathFormat::Posix => part.to_string(),
+        }
+    }
+}
+```
+
+---
+
+## Manifest Path Resolution
+
+When downloading files, manifest paths (which are relative) need to be converted to absolute local paths. This involves:
+
+1. Joining the relative path with the asset root
+2. Normalizing using the source path format
+3. Applying path mapping (if storage profiles differ)
+
+### Data Structures
+
+```rust
+/// A manifest path resolved to an absolute local destination.
+#[derive(Debug, Clone)]
+pub struct ResolvedManifestPath {
+    /// The original manifest file entry.
+    pub manifest_entry: ManifestFilePath,
+    /// The absolute local path where the file should be downloaded.
+    pub local_path: PathBuf,
+}
+
+/// Result of resolving manifest paths.
+#[derive(Debug, Clone, Default)]
+pub struct ResolvedManifestPaths {
+    /// Successfully resolved paths.
+    pub resolved: Vec<ResolvedManifestPath>,
+    /// Paths that could not be mapped (no matching rule).
+    pub unmapped: Vec<UnmappedPath>,
+}
+
+/// A path that could not be mapped.
+#[derive(Debug, Clone)]
+pub struct UnmappedPath {
+    /// The original manifest path.
+    pub manifest_path: String,
+    /// The absolute source path (after joining with root).
+    pub absolute_source_path: String,
+}
+```
+
+### Resolution Function
+
+```rust
+/// Resolve manifest paths to absolute local paths.
+/// 
+/// For each file in the manifest:
+/// 1. Join the relative path with `root_path` using `source_path_format` separators
+/// 2. Normalize the resulting path
+/// 3. Apply path mapping if `applier` is provided
+/// 
+/// # Arguments
+/// * `manifest` - The manifest containing relative file paths
+/// * `root_path` - The asset root path (from manifest metadata)
+/// * `source_path_format` - Path format of the source machine (from storage profile)
+/// * `applier` - Optional path mapping applier for cross-profile downloads
+/// 
+/// # Returns
+/// Resolved paths and any paths that couldn't be mapped.
+/// 
+/// # Example
+/// ```
+/// use rusty_attachments_storage::path_mapping::{
+///     resolve_manifest_paths, PathMappingApplier, PathFormat,
+/// };
+/// 
+/// let manifest = download_manifest(&client, bucket, key).await?;
+/// let root_path = "Z:\\Projects\\Job1";
+/// let source_format = PathFormat::Windows;
+/// 
+/// // Without path mapping (same storage profile)
+/// let result = resolve_manifest_paths(&manifest, root_path, source_format, None)?;
+/// 
+/// // With path mapping (different storage profiles)
+/// let applier = PathMappingApplier::new(&rules)?;
+/// let result = resolve_manifest_paths(&manifest, root_path, source_format, Some(&applier))?;
+/// 
+/// for resolved in result.resolved {
+///     println!("{} -> {}", resolved.manifest_entry.path, resolved.local_path.display());
+/// }
+/// 
+/// for unmapped in result.unmapped {
+///     eprintln!("WARNING: No mapping for {}", unmapped.absolute_source_path);
+/// }
+/// ```
+pub fn resolve_manifest_paths(
+    manifest: &Manifest,
+    root_path: &str,
+    source_path_format: PathFormat,
+    applier: Option<&PathMappingApplier>,
+) -> Result<ResolvedManifestPaths, PathMappingError> {
+    let mut result = ResolvedManifestPaths::default();
+    
+    let files = match manifest {
+        Manifest::V2023_03_03(m) => {
+            // Convert v2023 paths to v2025 format for uniform handling
+            m.paths.iter()
+                .map(|p| ManifestFilePath {
+                    path: p.path.clone(),
+                    hash: Some(p.hash.clone()),
+                    size: Some(p.size),
+                    mtime: Some(p.mtime),
+                    runnable: false,
+                    chunkhashes: None,
+                    symlink_target: None,
+                    deleted: false,
+                })
+                .collect::<Vec<_>>()
+        }
+        Manifest::V2025_12_04_beta(m) => m.paths.clone(),
+    };
+    
+    for entry in files {
+        // Skip deleted entries
+        if entry.deleted {
+            continue;
+        }
+        
+        // Join relative path with root using source format
+        let absolute_source = join_path(root_path, &entry.path, source_path_format);
+        
+        // Apply path mapping if provided
+        let local_path = if let Some(applier) = applier {
+            match applier.transform(&absolute_source) {
+                Some(mapped) => mapped,
+                None => {
+                    result.unmapped.push(UnmappedPath {
+                        manifest_path: entry.path.clone(),
+                        absolute_source_path: absolute_source,
+                    });
+                    continue;
+                }
+            }
+        } else {
+            PathBuf::from(&absolute_source)
+        };
+        
+        result.resolved.push(ResolvedManifestPath {
+            manifest_entry: entry,
+            local_path,
+        });
+    }
+    
+    Ok(result)
+}
+
+/// Join a root path with a relative path using the specified format.
+fn join_path(root: &str, relative: &str, format: PathFormat) -> String {
+    let separator = format.separator();
+    let root = root.trim_end_matches(|c| c == '/' || c == '\\');
+    let relative = relative.trim_start_matches(|c| c == '/' || c == '\\');
+    
+    // Normalize the relative path separators to match the format
+    let relative = match format {
+        PathFormat::Windows => relative.replace('/', "\\"),
+        PathFormat::Posix => relative.replace('\\', "/"),
+    };
+    
+    format!("{}{}{}", root, separator, relative)
+}
+```
+
+---
+
 ## Error Types
 
 Path mapping errors extend the common `PathError`:
@@ -354,6 +727,12 @@ pub enum PathMappingError {
     
     #[error("Invalid path format: {path}")]
     InvalidPath { path: String },
+    
+    #[error("No path mapping rule matched path: {path}")]
+    NoRuleMatched { path: String },
+    
+    #[error("Inconsistent source path formats in rules: expected {expected:?}, found {found:?}")]
+    InconsistentSourceFormats { expected: PathFormat, found: PathFormat },
 }
 ```
 
@@ -437,6 +816,7 @@ rusty-attachments/
 ## Related Documents
 
 - [common.md](common.md) - Shared path utilities (`from_posix_path`, `normalize_for_manifest`)
-- [storage-profiles.md](storage-profiles.md) - Storage profile and file system location types
+- [storage-profiles.md](storage-profiles.md) - Storage profile and file system location types, `generate_path_mapping_rules()`
 - [job-submission.md](job-submission.md) - Converting manifests to job attachments format
 - [manifest-storage.md](manifest-storage.md) - Manifest upload/download operations
+- [storage-design.md](storage-design.md) - Download orchestrator with `download_to_resolved_paths()`

@@ -438,8 +438,171 @@ When a storage profile is provided:
 
 ---
 
+## Path Mapping Rule Generation
+
+When downloading outputs from jobs submitted with a different storage profile, we need to generate path mapping rules to translate paths from the job's storage profile to the local machine's storage profile.
+
+### Storage Profile with OS Family
+
+```rust
+/// Operating system family for a storage profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageProfileOsFamily {
+    Windows,
+    Linux,
+    Macos,
+}
+
+impl StorageProfileOsFamily {
+    /// Convert to PathFormat for path mapping.
+    pub fn to_path_format(&self) -> PathFormat {
+        match self {
+            StorageProfileOsFamily::Windows => PathFormat::Windows,
+            StorageProfileOsFamily::Linux | StorageProfileOsFamily::Macos => PathFormat::Posix,
+        }
+    }
+}
+
+/// Extended storage profile with identifier and OS family.
+/// 
+/// This matches the structure returned by Deadline Cloud APIs:
+/// - `deadline.get_storage_profile()`
+/// - `deadline.get_storage_profile_for_queue()`
+#[derive(Debug, Clone)]
+pub struct StorageProfileWithId {
+    /// Unique identifier for this storage profile.
+    pub storage_profile_id: String,
+    /// Human-readable display name.
+    pub display_name: String,
+    /// Operating system family.
+    pub os_family: StorageProfileOsFamily,
+    /// File system locations in this profile.
+    pub file_system_locations: Vec<FileSystemLocation>,
+}
+```
+
+### Generate Path Mapping Rules
+
+```rust
+use crate::path_mapping::{PathMappingRule, PathFormat};
+
+/// Generate path mapping rules between source and destination storage profiles.
+/// 
+/// Creates a rule for each file system location name shared between profiles,
+/// regardless of type (LOCAL vs SHARED). This allows mapping paths from a job
+/// submitted with one storage profile to a machine with a different profile.
+/// 
+/// # Arguments
+/// * `source_profile` - The storage profile of the job submitter
+/// * `destination_profile` - The storage profile of the local machine
+/// 
+/// # Returns
+/// A list of path mapping rules. Empty if profiles are identical or share no
+/// location names.
+/// 
+/// # Example
+/// ```
+/// use rusty_attachments_storage::{
+///     StorageProfileWithId, StorageProfileOsFamily, FileSystemLocation,
+///     FileSystemLocationType, generate_path_mapping_rules,
+/// };
+/// 
+/// let source = StorageProfileWithId {
+///     storage_profile_id: "profile-windows".into(),
+///     display_name: "Windows Workstation".into(),
+///     os_family: StorageProfileOsFamily::Windows,
+///     file_system_locations: vec![
+///         FileSystemLocation {
+///             name: "ProjectFiles".into(),
+///             path: "Z:\\Projects".into(),
+///             location_type: FileSystemLocationType::Local,
+///         },
+///     ],
+/// };
+/// 
+/// let destination = StorageProfileWithId {
+///     storage_profile_id: "profile-linux".into(),
+///     display_name: "Linux Render Node".into(),
+///     os_family: StorageProfileOsFamily::Linux,
+///     file_system_locations: vec![
+///         FileSystemLocation {
+///             name: "ProjectFiles".into(),
+///             path: "/mnt/projects".into(),
+///             location_type: FileSystemLocationType::Local,
+///         },
+///     ],
+/// };
+/// 
+/// let rules = generate_path_mapping_rules(&source, &destination);
+/// // rules[0]: Z:\Projects -> /mnt/projects (Windows format)
+/// ```
+pub fn generate_path_mapping_rules(
+    source_profile: &StorageProfileWithId,
+    destination_profile: &StorageProfileWithId,
+) -> Vec<PathMappingRule> {
+    // If profiles are identical, no transformation needed
+    if source_profile.storage_profile_id == destination_profile.storage_profile_id {
+        return vec![];
+    }
+    
+    // Build lookup map for destination locations by name
+    let dest_locations: HashMap<&str, &str> = destination_profile
+        .file_system_locations
+        .iter()
+        .map(|loc| (loc.name.as_str(), loc.path.as_str()))
+        .collect();
+    
+    let source_format = source_profile.os_family.to_path_format();
+    
+    // Create a rule for each shared location name
+    source_profile
+        .file_system_locations
+        .iter()
+        .filter_map(|src_loc| {
+            dest_locations.get(src_loc.name.as_str()).map(|dest_path| {
+                PathMappingRule::new(source_format, &src_loc.path, *dest_path)
+            })
+        })
+        .collect()
+}
+```
+
+### Usage with Incremental Download
+
+```rust
+use rusty_attachments_storage::{
+    generate_path_mapping_rules, PathMappingApplier,
+    StorageProfileWithId,
+};
+
+// Load storage profiles from Deadline Cloud API
+let job_storage_profile: StorageProfileWithId = /* from deadline.get_storage_profile_for_queue() */;
+let local_storage_profile: StorageProfileWithId = /* local machine's profile */;
+
+// Generate rules
+let rules = generate_path_mapping_rules(&job_storage_profile, &local_storage_profile);
+
+// Create applier for efficient batch transformation
+let applier = if rules.is_empty() {
+    None
+} else {
+    Some(PathMappingApplier::new(&rules)?)
+};
+
+// Use applier when resolving manifest paths
+let resolved_paths = resolve_manifest_paths(
+    &manifest,
+    &root_path,
+    job_storage_profile.os_family.to_path_format(),
+    applier.as_ref(),
+)?;
+```
+
+---
+
 ## Related Documents
 
 - [common.md](common.md) - Shared path utilities (`lexical_normalize`, `to_absolute`)
 - [file_system.md](file_system.md) - Snapshot and diff operations
 - [job-submission.md](job-submission.md) - Converting manifests to job attachments format
+- [path-mapping.md](path-mapping.md) - Path mapping rules and applier

@@ -141,13 +141,33 @@ impl GlobFilter {
 /// Options for creating a directory snapshot
 #[derive(Debug, Clone)]
 pub struct SnapshotOptions {
-    /// Root directory to snapshot
+    /// Root directory to snapshot.
+    /// 
+    /// When `input_files` is None, the scanner recursively walks this directory
+    /// to discover all files (subject to `filter` patterns).
+    /// 
+    /// When `input_files` is Some, this root is used as the base for computing
+    /// relative paths in the manifest.
     pub root: PathBuf,
+    
+    /// Explicit list of input files to include in the snapshot.
+    /// 
+    /// When Some, only these files are included (no directory walking).
+    /// When None, the scanner walks `root` recursively to discover files.
+    /// 
+    /// This is useful when:
+    /// - Input files are already known (e.g., from asset_references.yaml)
+    /// - Files span multiple directories but share a common root
+    /// - You want to avoid the overhead of directory walking
+    /// 
+    /// All paths must be absolute and within `root`.
+    pub input_files: Option<Vec<PathBuf>>,
     
     /// Manifest version to create
     pub version: ManifestVersion,
     
-    /// Glob filter for include/exclude patterns
+    /// Glob filter for include/exclude patterns.
+    /// Applied during directory walking (when `input_files` is None).
     pub filter: GlobFilter,
     
     /// Hash algorithm to use
@@ -156,7 +176,8 @@ pub struct SnapshotOptions {
     /// Whether to follow symlinks (false = capture as symlinks)
     pub follow_symlinks: bool,
     
-    /// Whether to include empty directories (v2025 only)
+    /// Whether to include empty directories (v2025 only).
+    /// Only applies when walking directories (`input_files` is None).
     pub include_empty_dirs: bool,
     
     /// Optional hash cache for incremental hashing
@@ -170,6 +191,7 @@ impl Default for SnapshotOptions {
     fn default() -> Self {
         Self {
             root: PathBuf::new(),
+            input_files: None, // Walk directory by default
             version: ManifestVersion::V2025_12_04_beta,
             filter: GlobFilter::default(),
             hash_algorithm: HashAlgorithm::Xxh128,
@@ -450,8 +472,14 @@ impl Snapshot for FileSystemScanner {
         options: &SnapshotOptions,
         progress: Option<&dyn ProgressCallback>,
     ) -> Result<Manifest, FileSystemError> {
-        // 1. Walk directory tree
-        let entries = self.walk_directory(&options.root, &options.filter, progress)?;
+        // 1. Get file entries - either from explicit list or directory walk
+        let entries = if let Some(input_files) = &options.input_files {
+            // Use explicit file list - skip directory walking
+            self.entries_from_file_list(input_files, &options.root)?
+        } else {
+            // Walk directory tree to discover files
+            self.walk_directory(&options.root, &options.filter, progress)?
+        };
         
         // 2. Separate files, symlinks, directories
         let (files, symlinks, dirs) = self.categorize_entries(entries, options)?;
@@ -787,6 +815,60 @@ pub enum FileSystemError {
 2. Apply glob filters during walk to skip entire subtrees when possible
 3. Collect symlinks separately for validation
 4. Track empty directories for v2025 format
+
+### Explicit File List Strategy
+
+When `input_files` is provided in `SnapshotOptions`, directory walking is skipped:
+
+```rust
+impl FileSystemScanner {
+    /// Create walk entries from an explicit list of files.
+    /// 
+    /// This is used when input files are already known (e.g., from asset_references.yaml)
+    /// and directory walking would be redundant.
+    /// 
+    /// # Arguments
+    /// * `input_files` - Absolute paths to files to include
+    /// * `root` - Root directory for computing relative paths
+    /// 
+    /// # Returns
+    /// Walk entries for each valid file
+    /// 
+    /// # Errors
+    /// - `FileSystemError::PathOutsideRoot` if any file is not under root
+    fn entries_from_file_list(
+        &self,
+        input_files: &[PathBuf],
+        root: &Path,
+    ) -> Result<Vec<WalkEntry>, FileSystemError> {
+        let mut entries = Vec::with_capacity(input_files.len());
+        
+        for file_path in input_files {
+            // Validate path is within root
+            if !file_path.starts_with(root) {
+                return Err(FileSystemError::PathOutsideRoot {
+                    path: file_path.display().to_string(),
+                    root: root.display().to_string(),
+                });
+            }
+            
+            // Skip non-existent files (they should have been filtered earlier)
+            if !file_path.exists() {
+                log::warn!("Skipping non-existent file: {}", file_path.display());
+                continue;
+            }
+            
+            entries.push(WalkEntry {
+                path: file_path.clone(),
+            });
+        }
+        
+        Ok(entries)
+    }
+}
+```
+
+This approach is used by `group_asset_paths_validated()` which expands input directories to individual files before calling snapshot.
 
 ### Parallel Hashing Strategy
 
