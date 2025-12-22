@@ -503,51 +503,68 @@ pub struct ObjectInfo {
 
 ## Upload Module
 
+### Upload Options
+
+```rust
+/// Options for upload operations.
+#[derive(Debug, Clone)]
+pub struct UploadOptions {
+    /// Maximum concurrent uploads for small files.
+    /// Default: 10
+    pub max_concurrency: usize,
+    /// Threshold for small vs large file separation.
+    /// Default: 80MB
+    pub small_file_threshold: u64,
+}
+
+impl UploadOptions {
+    pub fn new() -> Self;
+    pub fn with_max_concurrency(self, max_concurrency: usize) -> Self;
+    pub fn with_small_file_threshold(self, threshold: u64) -> Self;
+}
+```
+
 ### Upload Orchestrator
 
-The upload orchestrator uses the `StorageClient` trait and shared business logic:
+The upload orchestrator uses the `StorageClient` trait and shared business logic.
+Files are uploaded in parallel using `futures::stream::buffer_unordered`:
 
 ```rust
 /// High-level upload operations using any StorageClient implementation
-pub struct UploadOrchestrator<C: StorageClient> {
-    client: C,
+pub struct UploadOrchestrator<'a, C: StorageClient> {
+    client: &'a C,
     location: S3Location,
+    s3_check_cache: Option<S3CheckCache>,
+    options: UploadOptions,
 }
 
-impl<C: StorageClient> UploadOrchestrator<C> {
-    /// Upload files from a manifest to CAS
+impl<'a, C: StorageClient> UploadOrchestrator<'a, C> {
+    pub fn new(client: &'a C, location: S3Location) -> Self;
+    pub fn with_s3_check_cache(self, cache: S3CheckCache) -> Self;
+    pub fn with_options(self, options: UploadOptions) -> Self;
+    
+    /// Upload all files referenced by a manifest to CAS.
     /// 
-    /// This function:
-    /// 1. Iterates through manifest entries
-    /// 2. Generates CAS keys from hashes
-    /// 3. Checks existence (skip if already uploaded)
-    /// 4. Handles chunked files (>256MB)
-    /// 5. Reports progress
-    pub async fn upload_manifest(
+    /// Uploads are performed in parallel:
+    /// - Small files (<80MB by default) are uploaded concurrently
+    /// - Large files use CRT's internal multipart parallelism
+    /// 
+    /// Note: This uploads the *contents* of a manifest (the actual files).
+    /// To upload the manifest JSON itself, use `manifest_storage::upload_input_manifest()`.
+    pub async fn upload_manifest_contents(
         &self,
-        manifest: &AssetManifest,
+        manifest: &Manifest,
         source_root: &str,
         progress: Option<&dyn ProgressCallback>,
     ) -> Result<TransferStatistics, StorageError>;
     
-    /// Upload a single file to CAS
-    /// Returns the hash and whether it was actually uploaded
-    pub async fn upload_file(
+    /// Check if a CAS object already exists with correct size.
+    pub async fn cas_object_exists(
         &self,
-        request: CasUploadRequest,
-        progress: Option<&dyn ProgressCallback>,
-    ) -> Result<UploadResult, StorageError>;
-    
-    /// Upload manifest JSON to S3
-    pub async fn upload_manifest_file(
-        &self,
-        manifest: &AssetManifest,
-        manifest_path: &str,
-        content_type: &str,
-    ) -> Result<String, StorageError>;
-    
-    /// Check if a CAS object already exists with correct size
-    pub async fn cas_object_exists(&self, hash: &str, expected_size: u64) -> Result<bool, StorageError>;
+        hash: &str,
+        algorithm: HashAlgorithm,
+        expected_size: u64,
+    ) -> Result<bool, StorageError>;
 }
 ```
 
@@ -613,111 +630,71 @@ pub enum UploadStrategy {
 
 ## Download Module
 
+### Download Options
+
+```rust
+/// Options for download operations.
+/// 
+/// Controls post-download verification, file metadata handling, and parallelism.
+#[derive(Debug, Clone)]
+pub struct DownloadOptions {
+    /// Verify downloaded file size matches manifest.
+    /// Default: true
+    pub verify_size: bool,
+    /// Set file modification time from manifest.
+    /// Default: true
+    pub set_mtime: bool,
+    /// Set executable bit on runnable files (Unix only).
+    /// Default: true
+    pub set_executable: bool,
+    /// Maximum concurrent downloads for small files.
+    /// Default: 10
+    pub max_concurrency: usize,
+    /// Threshold for small vs large file separation.
+    /// Default: 80MB
+    pub small_file_threshold: u64,
+}
+
+impl DownloadOptions {
+    pub fn new() -> Self;
+    pub fn no_verification() -> Self;
+    pub fn with_max_concurrency(self, max_concurrency: usize) -> Self;
+    pub fn with_small_file_threshold(self, threshold: u64) -> Self;
+}
+```
+
 ### Download Orchestrator
+
+The download orchestrator uses the `StorageClient` trait and handles parallel downloads
+using `futures::stream::buffer_unordered`:
 
 ```rust
 /// High-level download operations using any StorageClient implementation
-pub struct DownloadOrchestrator<C: StorageClient> {
-    client: C,
+pub struct DownloadOrchestrator<'a, C: StorageClient> {
+    client: &'a C,
     location: S3Location,
+    options: DownloadOptions,
 }
 
-impl<C: StorageClient> DownloadOrchestrator<C> {
-    /// Download files from a manifest to local filesystem
+impl<'a, C: StorageClient> DownloadOrchestrator<'a, C> {
+    pub fn new(client: &'a C, location: S3Location) -> Self;
+    pub fn with_options(self, options: DownloadOptions) -> Self;
+    
+    /// Download all files referenced by a manifest to local filesystem.
     /// 
-    /// This function:
-    /// 1. Iterates through manifest entries
-    /// 2. Resolves CAS keys from hashes
-    /// 3. Handles chunked files (reassembles from chunks)
-    /// 4. Handles symlinks (creates local symlinks)
-    /// 5. Sets file permissions (mtime, runnable)
-    /// 6. Reports progress
-    pub async fn download_manifest(
+    /// Downloads are performed in parallel:
+    /// - Small files (<80MB by default) are downloaded concurrently
+    /// - Large files use CRT's internal multipart parallelism
+    /// 
+    /// Note: This downloads the *contents* of a manifest (the actual files).
+    /// To download the manifest JSON itself, use `manifest_storage::download_manifest()`.
+    pub async fn download_manifest_contents(
         &self,
-        manifest: &AssetManifest,
+        manifest: &Manifest,
         destination_root: &str,
         conflict_resolution: ConflictResolution,
         progress: Option<&dyn ProgressCallback>,
     ) -> Result<TransferStatistics, StorageError>;
-    
-    /// Download files to pre-resolved absolute paths.
-    /// 
-    /// Unlike `download_manifest()` which joins manifest paths with a root,
-    /// this takes paths that are already resolved to absolute local destinations.
-    /// This is useful for:
-    /// - Cross-storage-profile downloads where paths have been mapped
-    /// - Incremental downloads where paths come from multiple manifests
-    /// - Custom download destinations
-    /// 
-    /// # Arguments
-    /// * `files` - Pre-resolved paths from `resolve_manifest_paths()`
-    /// * `hash_algorithm` - Hash algorithm used by the manifest
-    /// * `conflict_resolution` - How to handle existing files
-    /// * `options` - Download options (size verification, mtime setting, etc.)
-    /// * `progress` - Optional progress callback
-    /// 
-    /// # Example
-    /// ```
-    /// use rusty_attachments_storage::{
-    ///     DownloadOrchestrator, ConflictResolution, DownloadOptions,
-    ///     path_mapping::{resolve_manifest_paths, PathMappingApplier, PathFormat},
-    /// };
-    /// 
-    /// // Download manifest and resolve paths with mapping
-    /// let (manifest, metadata) = download_manifest(&client, bucket, key).await?;
-    /// let applier = PathMappingApplier::new(&rules)?;
-    /// let resolved = resolve_manifest_paths(
-    ///     &manifest,
-    ///     &metadata.asset_root,
-    ///     PathFormat::Windows,
-    ///     Some(&applier),
-    /// )?;
-    /// 
-    /// // Download to resolved paths with default options (verification enabled)
-    /// let stats = orchestrator.download_to_resolved_paths(
-    ///     &resolved.resolved,
-    ///     manifest.hash_alg(),
-    ///     ConflictResolution::CreateCopy,
-    ///     DownloadOptions::default(),
-    ///     Some(&progress_callback),
-    /// ).await?;
-    /// 
-    /// // Handle unmapped paths
-    /// for unmapped in &resolved.unmapped {
-    ///     eprintln!("Skipped (no mapping): {}", unmapped.absolute_source_path);
-    /// }
-    /// ```
-    pub async fn download_to_resolved_paths(
-        &self,
-        files: &[ResolvedManifestPath],
-        hash_algorithm: HashAlgorithm,
-        conflict_resolution: ConflictResolution,
-        options: DownloadOptions,
-        progress: Option<&dyn ProgressCallback<TransferProgress>>,
-    ) -> Result<TransferStatistics, StorageError>;
-    
-    /// Download a single file from CAS
-    pub async fn download_file(
-        &self,
-        request: CasDownloadRequest,
-        progress: Option<&dyn ProgressCallback>,
-    ) -> Result<DownloadResult, StorageError>;
-    
-    /// Download and decode a manifest from S3
-    pub async fn download_manifest_file(
-        &self,
-        manifest_path: &str,
-    ) -> Result<AssetManifest, StorageError>;
-    
-    /// List output manifests for a job/step/task
-    pub async fn list_output_manifests(
-        &self,
-        farm_id: &str,
-        queue_id: &str,
-        job_id: &str,
-        step_id: Option<&str>,
-        task_id: Option<&str>,
-    ) -> Result<Vec<ManifestInfo>, StorageError>;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1053,52 +1030,66 @@ pub fn apply_post_download_options(
 
 ### CRT Backend (Rust + Python via PyO3)
 
+The CRT backend implements `StorageClient` using the AWS SDK for Rust (`aws-sdk-s3`).
+This provides high-performance S3 operations with automatic retry, connection pooling,
+and multipart upload/download support.
+
 ```rust
 // crates/storage-crt/src/client.rs
 
-/// StorageClient implementation using AWS CRT
-/// Used directly by Rust applications and exposed to Python via PyO3
+use aws_sdk_s3::Client as S3Client;
+use rusty_attachments_storage::{StorageClient, StorageSettings, StorageError};
+
+/// StorageClient implementation using AWS SDK for Rust.
+/// Used directly by Rust applications and exposed to Python via PyO3.
 pub struct CrtStorageClient {
-    s3_client: aws_crt_s3::Client,
-    settings: StorageSettings,
+    s3_client: S3Client,
+    expected_bucket_owner: Option<String>,
 }
 
 impl CrtStorageClient {
-    pub fn new(settings: StorageSettings) -> Result<Self, StorageError>;
+    /// Create a new CRT storage client with default credentials.
+    pub async fn new(settings: StorageSettings) -> Result<Self, StorageError>;
+    
+    /// Create a new CRT storage client with explicit credentials.
+    pub async fn with_credentials(
+        settings: StorageSettings,
+        credentials: AwsCredentials,
+    ) -> Result<Self, StorageError>;
 }
 
 impl StorageClient for CrtStorageClient {
     fn expected_bucket_owner(&self) -> Option<&str> {
-        self.settings.expected_bucket_owner.as_deref()
+        self.expected_bucket_owner.as_deref()
     }
     
-    // Implement all trait methods using CRT APIs
-    // - Uses aws-crt-s3 for high-performance transfers
-    // - Automatic multipart for large objects
-    // - Connection pooling and retry logic (uses settings.upload_retry / download_retry)
-    // - All operations include ExpectedBucketOwner when configured
+    // All trait methods implemented using aws-sdk-s3:
+    // - head_object: HeadObjectRequest with ExpectedBucketOwner
+    // - put_object: PutObjectRequest with streaming body
+    // - put_object_from_file: ByteStream::from_path for efficient file uploads
+    // - put_object_from_file_range: ByteStream with offset/length for chunked uploads
+    // - get_object: GetObjectRequest with streaming response
+    // - get_object_to_file: Stream response to file
+    // - get_object_to_file_offset: Write at specific offset for chunked downloads
+    // - list_objects: ListObjectsV2 with pagination
 }
 ```
 
-#### CRT Thread Pool Management
+#### Multipart Upload Handling
 
-The AWS CRT manages its own internal thread pool for I/O operations. We do NOT need to create a separate thread pool for parallel uploads:
+The AWS SDK automatically handles multipart uploads for large files. The SDK's
+`ByteStream::from_path` efficiently streams file content without loading the
+entire file into memory.
 
-- **CRT handles parallelism internally**: The CRT S3 client automatically parallelizes multipart uploads and manages connection pooling
-- **No external ThreadPoolExecutor needed**: Unlike the Python implementation which uses `concurrent.futures.ThreadPoolExecutor`, the CRT handles this at the C layer
-- **Configuration via CRT settings**: Concurrency is controlled through CRT client configuration, not Rust-side thread pools
+For chunked uploads (files >256MB in v2 manifests), each chunk is uploaded as
+a separate CAS object using `put_object_from_file_range`.
 
-```rust
-// CRT client configuration handles parallelism
-let s3_client_config = aws_crt_s3::ClientConfig::new()
-    .with_throughput_target_gbps(10.0)  // CRT auto-tunes parallelism
-    .with_part_size(8 * 1024 * 1024);   // 8MB parts for multipart
-```
+#### Thread Pool Management
 
-The small/large file separation logic (see Upload Module) is still useful for:
-- Prioritizing which files to start first
-- Reducing wasted bandwidth on cancellation
-- But the actual parallel execution is handled by CRT, not our code
+The AWS SDK manages its own internal connection pool and async I/O. The upload
+and download orchestrators handle parallelism at the file level using
+`futures::stream::buffer_unordered`, while the SDK handles connection-level
+parallelism internally.
 
 ### WASM/JS SDK Backend
 
@@ -1210,19 +1201,27 @@ const stats = await orchestrator.uploadManifest(manifest, '/local/root', progres
 - [x] Define upload types and strategies in `cas.rs`
 - [x] Implement `UploadOrchestrator` (`upload.rs`)
 - [x] Implement small/large file queue separation
+- [x] Parallel uploads via `buffer_unordered` with configurable concurrency
+- [x] `UploadOptions` struct for concurrency and threshold configuration
+- [x] S3 check cache integration for skipping existence checks
+- [x] Progress reporting and cancellation support
 - [x] Unit tests for upload logic
 
 ### Phase 3: Download Module ✅ COMPLETE
 - [x] Define download types and strategies in `cas.rs`
 - [x] Implement `DownloadOrchestrator` (`download.rs`)
-- [x] Implement conflict resolution logic
+- [x] Implement conflict resolution logic (Skip, Overwrite, CreateCopy)
 - [x] Implement post-download verification (size, mtime, executable)
+- [x] Parallel downloads via `buffer_unordered` with configurable concurrency
+- [x] `DownloadOptions` struct for verification and concurrency configuration
+- [x] Chunked file reassembly
+- [x] Symlink creation (Unix and Windows)
 - [x] Unit tests for download logic
 
-### Phase 4: CRT Backend
-- [ ] Create `storage-crt` crate
-- [ ] Implement `CrtStorageClient`
-- [ ] Integration tests with LocalStack
+### Phase 4: CRT Backend ✅ COMPLETE
+- [x] Create `storage-crt` crate
+- [x] Implement `CrtStorageClient` using aws-sdk-s3
+- [ ] Integration tests with LocalStack (TODO)
 
 ### Phase 5: WASM Backend
 - [ ] Add storage bindings to `wasm` crate

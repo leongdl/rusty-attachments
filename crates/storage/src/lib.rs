@@ -28,11 +28,11 @@
 //!
 //! // Upload files from a manifest
 //! let upload_orch = UploadOrchestrator::new(&client, location.clone());
-//! let stats = upload_orch.upload_manifest(&manifest, "/source/root", None).await?;
+//! let stats = upload_orch.upload_manifest_contents(&manifest, "/source/root", None).await?;
 //!
 //! // Download files from a manifest
 //! let download_orch = DownloadOrchestrator::new(&client, location);
-//! let stats = download_orch.download_manifest(
+//! let stats = download_orch.download_manifest_contents(
 //!     &manifest,
 //!     "/dest/root",
 //!     ConflictResolution::CreateCopy,
@@ -56,7 +56,8 @@ pub use cas::{
 };
 pub use download::{
     generate_unique_copy_path, set_file_executable, set_file_mtime, verify_file_size,
-    DownloadOptions, DownloadOrchestrator,
+    DownloadOptions, DownloadOrchestrator, DEFAULT_DOWNLOAD_CONCURRENCY,
+    SMALL_FILE_THRESHOLD as DOWNLOAD_SMALL_FILE_THRESHOLD,
 };
 pub use error::{StorageError, TransferError};
 pub use hash_cache::{
@@ -90,4 +91,7 @@ pub use types::{
     DataSource, DownloadResult, OperationType, RetrySettings, S3Location, StorageSettings,
     TransferProgress, TransferStatistics, UploadResult, CHUNK_SIZE_NONE, CHUNK_SIZE_V2,
 };
-pub use upload::{UploadOrchestrator, SMALL_FILE_THRESHOLD};
+pub use upload::{
+    UploadOptions, UploadOrchestrator, DEFAULT_UPLOAD_CONCURRENCY,
+    SMALL_FILE_THRESHOLD as UPLOAD_SMALL_FILE_THRESHOLD,
+};
