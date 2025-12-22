@@ -48,18 +48,21 @@ rusty-attachments/
 ├── crates/
 │   ├── model/                    # Existing - manifest models
 │   │
-│   ├── storage/                  # NEW - Storage abstraction
+│   ├── storage/                  # Storage abstraction ✅ IMPLEMENTED
 │   │   ├── Cargo.toml
 │   │   └── src/
-│   │       ├── lib.rs
+│   │       ├── lib.rs            # Module exports
 │   │       ├── types.rs          # Shared data structures
 │   │       ├── traits.rs         # Storage traits/interfaces
 │   │       ├── cas.rs            # CAS key generation, chunking logic
-│   │       ├── upload.rs         # Upload orchestration
-│   │       ├── download.rs       # Download orchestration
-│   │       └── error.rs          # Error types
+│   │       ├── upload.rs         # Upload orchestration ✅ NEW
+│   │       ├── download.rs       # Download orchestration ✅ NEW
+│   │       ├── manifest_storage.rs # Manifest upload/download
+│   │       ├── error.rs          # Error types
+│   │       ├── hash_cache/       # File hash caching
+│   │       └── s3_check_cache/   # S3 existence caching
 │   │
-│   ├── storage-crt/              # NEW - CRT implementation
+│   ├── storage-crt/              # CRT implementation (TODO)
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── lib.rs
@@ -1193,22 +1196,28 @@ const stats = await orchestrator.uploadManifest(manifest, '/local/root', progres
 
 ## Implementation Plan
 
-### Phase 1: Core Types and Traits
-- [ ] Create `storage` crate
-- [ ] Define shared data structures (`types.rs`)
-- [ ] Define `StorageClient` trait (`traits.rs`)
-- [ ] Implement CAS key generation and chunking logic (`cas.rs`)
-- [ ] Define error types (`error.rs`)
+### Phase 1: Core Types and Traits ✅ COMPLETE
+- [x] Create `storage` crate
+- [x] Define shared data structures (`types.rs`)
+- [x] Define `StorageClient` trait (`traits.rs`)
+- [x] Implement CAS key generation and chunking logic (`cas.rs`)
+- [x] Define error types (`error.rs`)
+- [x] Implement hash cache (`hash_cache/`)
+- [x] Implement S3 check cache (`s3_check_cache/`)
+- [x] Implement manifest storage operations (`manifest_storage.rs`)
 
-### Phase 2: Upload Module
-- [ ] Implement upload logic (`upload.rs`)
-- [ ] Implement `UploadOrchestrator`
-- [ ] Unit tests for upload logic
+### Phase 2: Upload Module ✅ COMPLETE
+- [x] Define upload types and strategies in `cas.rs`
+- [x] Implement `UploadOrchestrator` (`upload.rs`)
+- [x] Implement small/large file queue separation
+- [x] Unit tests for upload logic
 
-### Phase 3: Download Module
-- [ ] Implement download logic (`download.rs`)
-- [ ] Implement `DownloadOrchestrator`
-- [ ] Unit tests for download logic
+### Phase 3: Download Module ✅ COMPLETE
+- [x] Define download types and strategies in `cas.rs`
+- [x] Implement `DownloadOrchestrator` (`download.rs`)
+- [x] Implement conflict resolution logic
+- [x] Implement post-download verification (size, mtime, executable)
+- [x] Unit tests for download logic
 
 ### Phase 4: CRT Backend
 - [ ] Create `storage-crt` crate

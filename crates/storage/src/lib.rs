@@ -17,18 +17,46 @@
 //!
 //! The `manifest_storage` module provides functions for uploading and downloading
 //! manifest files to/from S3 with proper metadata and content types.
+//!
+//! # Upload/Download Orchestration
+//!
+//! The `upload` and `download` modules provide high-level orchestrators for
+//! transferring files based on manifests:
+//!
+//! ```ignore
+//! use rusty_attachments_storage::{UploadOrchestrator, DownloadOrchestrator, S3Location};
+//!
+//! // Upload files from a manifest
+//! let upload_orch = UploadOrchestrator::new(&client, location.clone());
+//! let stats = upload_orch.upload_manifest(&manifest, "/source/root", None).await?;
+//!
+//! // Download files from a manifest
+//! let download_orch = DownloadOrchestrator::new(&client, location);
+//! let stats = download_orch.download_manifest(
+//!     &manifest,
+//!     "/dest/root",
+//!     ConflictResolution::CreateCopy,
+//!     None,
+//! ).await?;
+//! ```
 
 mod cas;
+mod download;
 mod error;
 pub mod hash_cache;
 pub mod manifest_storage;
 pub mod s3_check_cache;
 mod traits;
 mod types;
+mod upload;
 
 pub use cas::{
     expected_chunk_count, generate_chunks, needs_chunking, upload_strategy, ChunkInfo,
     DownloadStrategy, UploadStrategy,
+};
+pub use download::{
+    generate_unique_copy_path, set_file_executable, set_file_mtime, verify_file_size,
+    DownloadOptions, DownloadOrchestrator,
 };
 pub use error::{StorageError, TransferError};
 pub use hash_cache::{
@@ -62,3 +90,4 @@ pub use types::{
     DataSource, DownloadResult, OperationType, RetrySettings, S3Location, StorageSettings,
     TransferProgress, TransferStatistics, UploadResult, CHUNK_SIZE_NONE, CHUNK_SIZE_V2,
 };
+pub use upload::{UploadOrchestrator, SMALL_FILE_THRESHOLD};
