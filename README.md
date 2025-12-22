@@ -16,7 +16,8 @@ rusty-attachments/
 │   ├── model/      # Core manifest model
 │   ├── filesystem/ # Directory scanning, diff operations
 │   ├── profiles/   # Storage profiles, path grouping
-│   ├── storage/    # S3 storage, caching layers
+│   ├── storage/    # S3 storage abstraction, caching layers
+│   ├── storage-crt/# AWS SDK S3 backend implementation
 │   ├── python/     # PyO3 bindings
 │   └── wasm/       # WASM bindings
 └── design/         # Design documents
@@ -30,7 +31,8 @@ rusty-attachments/
 | `rusty-attachments-model` | Manifest structures, encode/decode, validation |
 | `rusty-attachments-filesystem` | Directory scanning, snapshot/diff operations, glob filtering |
 | `rusty-attachments-profiles` | Storage profiles, path grouping, asset root management |
-| `rusty-attachments-storage` | S3 storage traits, hash cache, S3 check cache, manifest upload |
+| `rusty-attachments-storage` | S3 storage traits, upload/download orchestration, caching |
+| `rusty-attachments-storage-crt` | AWS SDK S3 backend (`StorageClient` implementation) |
 
 ## Building
 
@@ -44,6 +46,7 @@ cargo build -p rusty-attachments-model
 cargo build -p rusty-attachments-filesystem
 cargo build -p rusty-attachments-profiles
 cargo build -p rusty-attachments-storage
+cargo build -p rusty-attachments-storage-crt
 
 # Check without building (faster)
 cargo check
@@ -61,6 +64,7 @@ cargo test -p rusty-attachments-model
 cargo test -p rusty-attachments-filesystem
 cargo test -p rusty-attachments-profiles
 cargo test -p rusty-attachments-storage
+cargo test -p rusty-attachments-storage-crt
 
 # Run tests with output
 cargo test -- --nocapture

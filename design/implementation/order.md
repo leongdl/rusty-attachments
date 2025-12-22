@@ -146,12 +146,37 @@ Storage profiles and path grouping logic, separate from network operations.
 - [x] `head_object_with_metadata()` - StorageClient trait method for metadata retrieval
 - [x] `MissingAssetRoot` error - For compatibility with Python's MissingAssetRootError
 
-### 6b. Upload Orchestrator
+### 6b. Upload Orchestrator ✅ COMPLETE
 
-- [ ] `UploadOrchestrator` struct
-- [ ] `upload_manifest()` - Upload CAS objects from manifest
-- [ ] `with_expected_bucket_owner()` - Security configuration
-- [ ] Integration with S3 check cache
+- [x] `UploadOrchestrator` struct
+- [x] `upload_manifest_contents()` - Upload CAS objects from manifest
+- [x] `UploadOptions` - Concurrency and threshold configuration
+- [x] `with_s3_check_cache()` - S3 check cache integration
+- [x] Parallel uploads via `buffer_unordered`
+- [x] Small/large file queue separation
+
+### 6d. Download Orchestrator ✅ COMPLETE
+
+- [x] `DownloadOrchestrator` struct
+- [x] `download_manifest_contents()` - Download CAS objects from manifest
+- [x] `DownloadOptions` - Verification and concurrency configuration
+- [x] Conflict resolution (Skip, Overwrite, CreateCopy)
+- [x] Post-download verification (size, mtime, executable)
+- [x] Chunked file reassembly
+- [x] Symlink creation (Unix and Windows)
+- [x] Parallel downloads via `buffer_unordered`
+
+### 6e. CRT Backend ✅ COMPLETE
+
+**Crate:** `storage-crt`
+
+- [x] `CrtStorageClient` - `StorageClient` implementation using AWS SDK for Rust
+- [x] `head_object()` / `head_object_with_metadata()` - Object existence and metadata
+- [x] `put_object()` / `put_object_from_file()` / `put_object_from_file_range()` - Uploads
+- [x] `get_object()` / `get_object_to_file()` / `get_object_to_file_offset()` - Downloads
+- [x] `list_objects()` - Paginated listing
+- [x] ExpectedBucketOwner support on all operations
+- [ ] Integration tests with LocalStack (TODO)
 
 ---
 
@@ -182,20 +207,22 @@ Storage profiles and path grouping logic, separate from network operations.
 ## Critical Path
 
 ```
-common → filesystem → profiles → upload orchestrator → bundle submit
-              ↓           ↓
-           caches    path mapping
-         (parallel)
+common → filesystem → profiles → storage (upload/download) → bundle submit
+              ↓           ↓              ↓
+           caches    path mapping    storage-crt
+         (parallel)                  (backend)
 ```
 
 ---
 
 ## Suggested Approach
 
-1. Start with **Phase 2 (common)** - everything depends on it
-2. **Phase 3 (filesystem)** and **Phase 4 (caches)** can be done in parallel
-3. **Phase 5-7** build sequentially
-4. **Phase 8** composes everything together
+1. Start with **Phase 2 (common)** - everything depends on it ✅ DONE
+2. **Phase 3 (filesystem)** and **Phase 4 (caches)** can be done in parallel ✅ DONE
+3. **Phase 5 (profiles)** ✅ DONE
+4. **Phase 6 (storage)** - Upload/download orchestration and CRT backend ✅ DONE
+5. **Phase 7 (job submission)** - Next up
+6. **Phase 8 (integration)** - Composes everything together
 
 ---
 

@@ -55,18 +55,19 @@ rusty-attachments/
 │   │       ├── types.rs          # Shared data structures
 │   │       ├── traits.rs         # Storage traits/interfaces
 │   │       ├── cas.rs            # CAS key generation, chunking logic
-│   │       ├── upload.rs         # Upload orchestration ✅ NEW
-│   │       ├── download.rs       # Download orchestration ✅ NEW
+│   │       ├── upload.rs         # Upload orchestration ✅ IMPLEMENTED
+│   │       ├── download.rs       # Download orchestration ✅ IMPLEMENTED
 │   │       ├── manifest_storage.rs # Manifest upload/download
 │   │       ├── error.rs          # Error types
 │   │       ├── hash_cache/       # File hash caching
 │   │       └── s3_check_cache/   # S3 existence caching
 │   │
-│   ├── storage-crt/              # CRT implementation (TODO)
+│   ├── storage-crt/              # AWS SDK S3 backend ✅ IMPLEMENTED
 │   │   ├── Cargo.toml
 │   │   └── src/
-│   │       ├── lib.rs
-│   │       └── client.rs         # CRT-based StorageClient
+│   │       ├── lib.rs            # Module exports
+│   │       ├── client.rs         # CrtStorageClient implementation
+│   │       └── error.rs          # CRT-specific errors
 │   │
 │   ├── python/                   # Existing - PyO3 bindings (uses CRT backend)
 │   │   └── src/

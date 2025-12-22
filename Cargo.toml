@@ -6,6 +6,7 @@ members = [
     "crates/model",
     "crates/profiles",
     "crates/storage",
+    "crates/storage-crt",
     "crates/python",
     "crates/wasm",
 ]
