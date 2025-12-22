@@ -74,15 +74,19 @@ Directory scanning and manifest creation.
 
 ## Phase 5: Storage Profiles & Path Grouping
 
-**Location:** `storage` crate
+**Crate:** `profiles` ✅ COMPLETE
 
-- [ ] `FileSystemLocationType` enum (Local/Shared)
-- [ ] `FileSystemLocation` struct
-- [ ] `StorageProfile` struct
-- [ ] `AssetRootGroup` struct
-- [ ] `group_asset_paths()` - Basic grouping logic
-- [ ] `PathValidationMode`, `PathGroupingResult`, `PathGroupingError`
-- [ ] `group_asset_paths_validated()` - Grouping with validation
+Storage profiles and path grouping logic, separate from network operations.
+
+- [x] `FileSystemLocationType` enum (Local/Shared)
+- [x] `FileSystemLocation` struct
+- [x] `StorageProfile` struct
+- [x] `StorageProfileOsFamily` enum
+- [x] `StorageProfileWithId` struct
+- [x] `AssetRootGroup` struct
+- [x] `group_asset_paths()` - Basic grouping logic
+- [x] `PathValidationMode`, `PathGroupingResult`, `PathGroupingError`
+- [x] `group_asset_paths_validated()` - Grouping with validation
 
 ---
 
@@ -133,9 +137,10 @@ Directory scanning and manifest creation.
 ## Critical Path
 
 ```
-common → filesystem → storage profiles → upload orchestrator → bundle submit
-              ↓
-           caches (parallel)
+common → filesystem → profiles → upload orchestrator → bundle submit
+              ↓           ↓
+           caches    path mapping
+         (parallel)
 ```
 
 ---

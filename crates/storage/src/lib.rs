@@ -26,8 +26,8 @@ pub use cas::{
 };
 pub use error::{StorageError, TransferError};
 pub use hash_cache::{
-    HashCache, HashCacheBackend, HashCacheEntry, HashCacheError, HashCacheKey,
-    SqliteHashCache, DEFAULT_HASH_CACHE_TTL_DAYS,
+    HashCache, HashCacheBackend, HashCacheEntry, HashCacheError, HashCacheKey, SqliteHashCache,
+    DEFAULT_HASH_CACHE_TTL_DAYS,
 };
 pub use s3_check_cache::{
     S3CheckCache, S3CheckCacheBackend, S3CheckCacheEntry, S3CheckCacheError, S3CheckCacheKey,
