@@ -4,6 +4,7 @@ members = [
     "crates/common",
     "crates/filesystem",
     "crates/model",
+    "crates/profiles",
     "crates/storage",
     "crates/python",
     "crates/wasm",
@@ -23,3 +24,4 @@ async-trait = "0.1"
 tempfile = "3.0"
 rusty-attachments-common = { path = "crates/common" }
 rusty-attachments-model = { path = "crates/model" }
+rusty-attachments-profiles = { path = "crates/profiles" }

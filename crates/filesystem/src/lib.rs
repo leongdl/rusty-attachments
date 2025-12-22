@@ -5,8 +5,10 @@
 //! - `expand_input_paths()` - Directory-to-file expansion
 //! - `validate_input_paths()` - Path validation
 //! - `StatCache` - File stat caching (LRU)
-//! - `FileSystemScanner` - Snapshot and diff operations
+//! - `FileSystemScanner` - Snapshot operations
+//! - `DiffEngine` - Diff operations comparing directories against manifests
 
+pub mod diff;
 pub mod error;
 pub mod expand;
 pub mod glob;
@@ -15,6 +17,7 @@ pub mod stat_cache;
 pub mod symlink;
 
 // Re-export main types
+pub use diff::{DiffEngine, DiffMode, DiffOptions, DiffResult, DiffStats, FileEntry};
 pub use error::FileSystemError;
 pub use expand::{expand_input_paths, validate_input_paths, ExpandedInputPaths, ValidatedInputPaths};
 pub use glob::{escape_glob, GlobFilter};
