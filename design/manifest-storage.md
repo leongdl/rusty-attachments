@@ -45,6 +45,129 @@ The timestamp format is ISO 8601: `YYYY-MM-DDTHH:MM:SS.ffffffZ` (e.g., `2025-05-
 
 ---
 
+## S3 Key Format Functions ✅ IMPLEMENTED
+
+These functions define the contract for S3 key structure. They are pure functions that format the full S3 key given the required components.
+
+```rust
+/// Format the full S3 key for an input manifest.
+///
+/// Key format: `{manifest_prefix}/{farm_id}/{queue_id}/Inputs/{guid}/{manifest_name}`
+///
+/// # Arguments
+/// * `manifest_prefix` - The manifest prefix (e.g., "DeadlineCloud/Manifests")
+/// * `farm_id` - Farm ID
+/// * `queue_id` - Queue ID
+/// * `guid` - Random GUID for uniqueness
+/// * `manifest_name` - Manifest filename (e.g., "{hash}_input")
+pub fn format_input_manifest_s3_key(
+    manifest_prefix: &str,
+    farm_id: &str,
+    queue_id: &str,
+    guid: &str,
+    manifest_name: &str,
+) -> String;
+
+/// Format the full S3 key for a task-level output manifest.
+///
+/// Key format: `{manifest_prefix}/{farm_id}/{queue_id}/{job_id}/{step_id}/{task_id}/{timestamp}_{session_action_id}/{manifest_name}`
+///
+/// # Arguments
+/// * `manifest_prefix` - The manifest prefix (e.g., "DeadlineCloud/Manifests")
+/// * `farm_id` - Farm ID
+/// * `queue_id` - Queue ID
+/// * `job_id` - Job ID
+/// * `step_id` - Step ID
+/// * `task_id` - Task ID
+/// * `timestamp_str` - ISO 8601 formatted timestamp
+/// * `session_action_id` - Session action ID
+/// * `manifest_name` - Manifest filename (e.g., "{hash}_output")
+pub fn format_task_output_manifest_s3_key(
+    manifest_prefix: &str,
+    farm_id: &str,
+    queue_id: &str,
+    job_id: &str,
+    step_id: &str,
+    task_id: &str,
+    timestamp_str: &str,
+    session_action_id: &str,
+    manifest_name: &str,
+) -> String;
+
+/// Format the full S3 key for a step-level output manifest (no task).
+///
+/// Key format: `{manifest_prefix}/{farm_id}/{queue_id}/{job_id}/{step_id}/{timestamp}_{session_action_id}/{manifest_name}`
+///
+/// # Arguments
+/// * `manifest_prefix` - The manifest prefix (e.g., "DeadlineCloud/Manifests")
+/// * `farm_id` - Farm ID
+/// * `queue_id` - Queue ID
+/// * `job_id` - Job ID
+/// * `step_id` - Step ID
+/// * `timestamp_str` - ISO 8601 formatted timestamp
+/// * `session_action_id` - Session action ID
+/// * `manifest_name` - Manifest filename (e.g., "{hash}_output")
+pub fn format_step_output_manifest_s3_key(
+    manifest_prefix: &str,
+    farm_id: &str,
+    queue_id: &str,
+    job_id: &str,
+    step_id: &str,
+    timestamp_str: &str,
+    session_action_id: &str,
+    manifest_name: &str,
+) -> String;
+```
+
+### Example Usage
+
+```rust
+use rusty_attachments_storage::{
+    format_input_manifest_s3_key,
+    format_task_output_manifest_s3_key,
+    format_step_output_manifest_s3_key,
+};
+
+// Input manifest key
+let input_key = format_input_manifest_s3_key(
+    "DeadlineCloud/Manifests",
+    "farm-123",
+    "queue-456",
+    "abcd1234efgh5678",
+    "a1b2c3d4_input",
+);
+// Result: "DeadlineCloud/Manifests/farm-123/queue-456/Inputs/abcd1234efgh5678/a1b2c3d4_input"
+
+// Task-level output manifest key
+let task_key = format_task_output_manifest_s3_key(
+    "DeadlineCloud/Manifests",
+    "farm-123",
+    "queue-456",
+    "job-789",
+    "step-abc",
+    "task-def",
+    "2025-05-22T22:17:03.409012Z",
+    "sessionaction-xyz",
+    "hash123_output",
+);
+// Result: "DeadlineCloud/Manifests/farm-123/queue-456/job-789/step-abc/task-def/2025-05-22T22:17:03.409012Z_sessionaction-xyz/hash123_output"
+
+// Step-level output manifest key (no task)
+let step_key = format_step_output_manifest_s3_key(
+    "DeadlineCloud/Manifests",
+    "farm-123",
+    "queue-456",
+    "job-789",
+    "step-abc",
+    "2025-05-22T22:17:03.409012Z",
+    "sessionaction-xyz",
+    "hash123_output",
+);
+// Result: "DeadlineCloud/Manifests/farm-123/queue-456/job-789/step-abc/2025-05-22T22:17:03.409012Z_sessionaction-xyz/hash123_output"
+```
+
+---
+
 ## S3 Metadata
 
 Manifests are uploaded with S3 user metadata to track the asset root and optional file system location.

@@ -30,7 +30,7 @@ rusty-attachments/
 | `rusty-attachments-model` | Manifest structures, encode/decode, validation |
 | `rusty-attachments-filesystem` | Directory scanning, snapshot/diff operations, glob filtering |
 | `rusty-attachments-profiles` | Storage profiles, path grouping, asset root management |
-| `rusty-attachments-storage` | S3 storage traits, hash cache, S3 check cache |
+| `rusty-attachments-storage` | S3 storage traits, hash cache, S3 check cache, manifest upload |
 
 ## Building
 

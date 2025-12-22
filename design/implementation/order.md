@@ -107,12 +107,32 @@ Storage profiles and path grouping logic, separate from network operations.
 - [x] `upload_input_manifest()` - Upload manifest with metadata
 - [x] `upload_task_output_manifest()` - Upload task-level output manifest
 - [x] `upload_step_output_manifest()` - Upload step-level output manifest
+- [x] S3 Key Format Functions (contract for S3 key structure):
+  - `format_input_manifest_s3_key()` - Format input manifest S3 key
+  - `format_task_output_manifest_s3_key()` - Format task-level output manifest S3 key
+  - `format_step_output_manifest_s3_key()` - Format step-level output manifest S3 key
 - [x] Utility functions:
   - `float_to_iso_datetime_string()` - Timestamp conversion
   - `generate_random_guid()` - GUID generation
   - `compute_manifest_name_hash()` - Manifest naming
   - `compute_root_path_hash()` - Root path hash for output manifests
   - `get_manifest_content_type()` - Content type selection
+  - `build_partial_input_manifest_prefix()` - Build partial prefix for input manifests
+
+### 6c. Manifest Download (Not Started)
+
+- [ ] `download_manifest()` - Download manifest by S3 key
+- [ ] `download_input_manifest()` - Download manifest by hash
+- [ ] Output manifest discovery primitives:
+  - `OutputManifestScope` enum
+  - `build_output_manifest_prefix()` - Build S3 prefix for listing
+  - `filter_output_manifest_keys()` - Filter to manifest files
+  - `parse_manifest_keys()` - Extract task IDs and session folders
+  - `group_manifests_by_task()` - Group by task ID
+  - `select_latest_manifests_per_task()` - Select latest per task
+- [ ] `discover_output_manifest_keys()` - Composed discovery function
+- [ ] `download_output_manifests_by_asset_root()` - Download and group by root
+- [ ] `match_manifests_to_roots()` - Match manifest keys to job attachment roots
 
 ### 6b. Upload Orchestrator
 
