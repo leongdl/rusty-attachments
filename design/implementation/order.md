@@ -99,12 +99,20 @@ Storage profiles and path grouping logic, separate from network operations.
 
 **Location:** `storage` crate
 
-### 6a. Manifest Storage
+### 6a. Manifest Storage ✅ COMPLETE
 
-- [ ] `ManifestLocation` struct
-- [ ] `ManifestS3Metadata` struct
-- [ ] `ManifestUploadResult` struct
-- [ ] `upload_input_manifest()` - Upload manifest with metadata
+- [x] `ManifestLocation` struct
+- [x] `ManifestS3Metadata` struct
+- [x] `ManifestUploadResult` struct
+- [x] `upload_input_manifest()` - Upload manifest with metadata
+- [x] `upload_task_output_manifest()` - Upload task-level output manifest
+- [x] `upload_step_output_manifest()` - Upload step-level output manifest
+- [x] Utility functions:
+  - `float_to_iso_datetime_string()` - Timestamp conversion
+  - `generate_random_guid()` - GUID generation
+  - `compute_manifest_name_hash()` - Manifest naming
+  - `compute_root_path_hash()` - Root path hash for output manifests
+  - `get_manifest_content_type()` - Content type selection
 
 ### 6b. Upload Orchestrator
 
