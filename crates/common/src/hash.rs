@@ -17,6 +17,17 @@ pub fn hash_bytes(data: &[u8]) -> String {
     format!("{:032x}", hash)
 }
 
+/// Compute XXH128 hash of a string (convenience wrapper).
+///
+/// # Arguments
+/// * `s` - String to hash
+///
+/// # Returns
+/// 32-character lowercase hex string (128 bits).
+pub fn hash_string(s: &str) -> String {
+    hash_bytes(s.as_bytes())
+}
+
 /// Compute XXH128 hash of a file.
 ///
 /// Reads the file in chunks to avoid loading entire file into memory.
@@ -108,6 +119,21 @@ mod tests {
         let hash1: String = hash_bytes(b"hello");
         let hash2: String = hash_bytes(b"world");
         assert_ne!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_hash_string() {
+        let hash: String = hash_string("hello world");
+        assert_eq!(hash.len(), 32);
+        // Should be identical to hash_bytes with same content
+        assert_eq!(hash, hash_bytes(b"hello world"));
+    }
+
+    #[test]
+    fn test_hash_string_empty() {
+        let hash: String = hash_string("");
+        assert_eq!(hash.len(), 32);
+        assert_eq!(hash, hash_bytes(b""));
     }
 
     #[test]

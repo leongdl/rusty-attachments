@@ -360,44 +360,42 @@ fn common_path(paths: &[&Path]) -> Option<PathBuf> {
         return Some(paths[0].to_path_buf());
     }
 
-    let path_strs: Vec<String> = paths
-        .iter()
-        .map(|p| p.to_string_lossy().into_owned())
-        .collect();
+    // Use Path components for safe comparison instead of string slicing
+    let first_components: Vec<_> = paths[0].components().collect();
 
-    let first: &str = &path_strs[0];
-    let mut common_len: usize = first.len();
+    // Find the longest common prefix by comparing components
+    let mut common_count: usize = first_components.len();
 
-    for path_str in &path_strs[1..] {
-        common_len = first
-            .chars()
-            .zip(path_str.chars())
-            .take(common_len)
+    for path in &paths[1..] {
+        let components: Vec<_> = path.components().collect();
+        let matching: usize = first_components
+            .iter()
+            .zip(components.iter())
             .take_while(|(a, b)| a == b)
             .count();
+        common_count = common_count.min(matching);
     }
 
-    if common_len == 0 {
+    if common_count == 0 {
         return None;
     }
 
-    let common: &str = &first[..common_len];
-    let trimmed: &str = if common.ends_with(std::path::MAIN_SEPARATOR) {
-        &common[..common.len() - 1]
-    } else if let Some(pos) = common.rfind(std::path::MAIN_SEPARATOR) {
-        &common[..pos]
-    } else {
-        common
-    };
+    // Build the common path from components
+    let common: PathBuf = first_components[..common_count].iter().collect();
 
-    if trimmed.is_empty() {
+    // If the common path is a file (all paths share the same file), return its parent
+    // This happens when paths.len() == 1 case is already handled above, so this
+    // means we have multiple paths that share a common prefix
+    if common.is_file() {
+        common.parent().map(|p| p.to_path_buf())
+    } else if common.as_os_str().is_empty() {
         #[cfg(unix)]
         return Some(PathBuf::from("/"));
         #[cfg(windows)]
         return None;
+    } else {
+        Some(common)
     }
-
-    Some(PathBuf::from(trimmed))
 }
 
 #[cfg(test)]
@@ -642,5 +640,38 @@ mod tests {
         let paths: Vec<&Path> = vec![Path::new("/a/b"), Path::new("/x/y")];
         let result: Option<PathBuf> = common_path(&paths);
         assert_eq!(result, Some(PathBuf::from("/")));
+    }
+
+    #[test]
+    fn test_common_path_utf8_paths() {
+        // Test with multi-byte UTF-8 characters (Japanese)
+        let paths: Vec<&Path> = vec![
+            Path::new("/プロジェクト/ファイル1.txt"),
+            Path::new("/プロジェクト/ファイル2.txt"),
+        ];
+        let result: Option<PathBuf> = common_path(&paths);
+        assert_eq!(result, Some(PathBuf::from("/プロジェクト")));
+    }
+
+    #[test]
+    fn test_common_path_utf8_partial_match() {
+        // Test where common prefix ends mid-character boundary
+        let paths: Vec<&Path> = vec![
+            Path::new("/日本語/テスト"),
+            Path::new("/日本/別のパス"),
+        ];
+        let result: Option<PathBuf> = common_path(&paths);
+        // Should find common prefix up to last separator before divergence
+        assert_eq!(result, Some(PathBuf::from("/")));
+    }
+
+    #[test]
+    fn test_common_path_mixed_ascii_utf8() {
+        let paths: Vec<&Path> = vec![
+            Path::new("/projects/日本語/file.txt"),
+            Path::new("/projects/日本語/other.txt"),
+        ];
+        let result: Option<PathBuf> = common_path(&paths);
+        assert_eq!(result, Some(PathBuf::from("/projects/日本語")));
     }
 }

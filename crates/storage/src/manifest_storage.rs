@@ -23,7 +23,6 @@
 
 use std::collections::HashMap;
 
-use futures::future::join_all;
 use regex::Regex;
 use rusty_attachments_common::hash_bytes;
 use rusty_attachments_model::Manifest;
@@ -1009,9 +1008,9 @@ pub struct ParsedManifestKey {
     pub last_modified: i64,
     /// Task ID if this is a task-level manifest, None for step-level (chunked).
     pub task_id: Option<String>,
-    /// The timestamp_sessionaction folder name.
+    /// The timestamp_sessionaction folder name (e.g., "2025-05-22T12:00:00.000000Z_sessionaction-abc-123").
     pub session_folder: String,
-    /// Session action ID extracted from the folder name.
+    /// Session action ID extracted from the folder name (e.g., "sessionaction-abc-123").
     pub session_action_id: String,
 }
 
@@ -1306,10 +1305,10 @@ pub async fn download_output_manifests_by_asset_root<C: StorageClient>(
     Ok(by_root)
 }
 
-/// Download multiple manifests in parallel.
+/// Download multiple manifests in parallel with concurrency limiting.
 ///
 /// Downloads manifests concurrently up to the specified `max_concurrency`.
-/// All downloads are initiated and awaited together using `join_all`.
+/// Uses `buffer_unordered` to limit the number of concurrent downloads.
 ///
 /// # Arguments
 /// * `client` - Storage client for S3 operations
@@ -1336,20 +1335,16 @@ pub async fn download_manifests_parallel<C: StorageClient>(
     keys: &[String],
     options: &ManifestDownloadOptions,
 ) -> Result<Vec<DownloadedManifest>, StorageError> {
+    use futures::stream::{self, StreamExt};
+
     if keys.is_empty() {
         return Ok(Vec::new());
     }
 
-    // Note: Currently we use join_all which starts all futures immediately.
-    // The max_concurrency is available for future implementation with
-    // FuturesUnordered + buffer_unordered for true concurrency limiting.
-    // For now, the underlying StorageClient implementation should handle
-    // connection pooling and rate limiting.
-    let _ = options.max_concurrency; // Reserved for future use
+    // Use buffer_unordered to limit concurrent downloads
+    let max_concurrency: usize = options.max_concurrency.max(1);
 
-    // Create futures for all downloads
-    let download_futures: Vec<_> = keys
-        .iter()
+    let results: Vec<Result<DownloadedManifest, StorageError>> = stream::iter(keys.iter())
         .map(|key| async move {
             let (manifest, metadata) = download_manifest(client, bucket, key).await?;
 
@@ -1366,10 +1361,9 @@ pub async fn download_manifests_parallel<C: StorageClient>(
                 last_modified: metadata.last_modified.unwrap_or(0),
             })
         })
-        .collect();
-
-    // Execute all downloads in parallel and collect results
-    let results: Vec<Result<DownloadedManifest, StorageError>> = join_all(download_futures).await;
+        .buffer_unordered(max_concurrency)
+        .collect()
+        .await;
 
     // Collect successful results or return first error
     let mut downloaded: Vec<DownloadedManifest> = Vec::with_capacity(keys.len());

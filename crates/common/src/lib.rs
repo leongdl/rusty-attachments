@@ -17,7 +17,7 @@ pub mod progress;
 // Re-export commonly used items at crate root
 pub use constants::*;
 pub use error::{PathError, VersionNotCompatibleError};
-pub use hash::{hash_bytes, hash_file, Xxh3Hasher};
+pub use hash::{hash_bytes, hash_file, hash_string, Xxh3Hasher};
 pub use machine_id::get_machine_id;
 pub use path_utils::{
     from_posix_path, is_within_root, lexical_normalize, normalize_for_manifest, to_absolute,
