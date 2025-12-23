@@ -182,35 +182,54 @@ Storage profiles and path grouping logic, separate from network operations.
 
 ## Phase 7: Job Submission Conversion
 
-**Location:** `storage` crate
+**Crate:** `ja-deadline-utils`
+
+New crate for Deadline Cloud-specific job attachment utilities. This separates Deadline-specific business logic from the generic storage primitives.
+
+### 7a. Data Types
 
 - [ ] `PathFormat` enum (Windows/Posix)
 - [ ] `ManifestProperties` struct
 - [ ] `Attachments` struct
 - [ ] `AssetRootManifest` struct
-- [ ] `build_manifest_properties()`
-- [ ] `build_attachments()`
+- [ ] `AssetReferences` struct (parsed from job bundle)
+
+### 7b. Conversion Functions
+
+- [ ] `build_manifest_properties()` - Convert uploaded manifest to API format
+- [ ] `build_attachments()` - Build Attachments payload for CreateJob API
+- [ ] `to_job_attachments()` - Full conversion pipeline
 
 ---
 
-## Phase 8: Integration
+## Phase 8: Bundle Submit Integration
 
-**Location:** `storage` crate or new `bundle` crate
+**Crate:** `ja-deadline-utils`
 
-- [ ] `AssetReferences` struct
+High-level orchestration that composes all primitives.
+
+### 8a. Bundle Submit
+
+- [ ] `BundleSubmitOptions` struct
 - [ ] `BundleSubmitResult` struct
 - [ ] `BundleSubmitError` enum
-- [ ] `submit_bundle_attachments()` - Main entry point
+- [ ] `submit_bundle_attachments()` - Main entry point for job submission
+
+### 8b. Worker Agent Support (Future)
+
+- [ ] `sync_inputs()` - Download job inputs to worker
+- [ ] `sync_outputs()` - Upload job outputs from worker
+- [ ] `WorkerSyncOptions` struct
 
 ---
 
 ## Critical Path
 
 ```
-common → filesystem → profiles → storage (upload/download) → bundle submit
-              ↓           ↓              ↓
-           caches    path mapping    storage-crt
-         (parallel)                  (backend)
+common → filesystem → profiles → storage (upload/download) → ja-deadline-utils
+              ↓           ↓              ↓                          ↓
+           caches    path mapping    storage-crt              bundle submit
+         (parallel)                  (backend)               worker sync
 ```
 
 ---
@@ -221,8 +240,8 @@ common → filesystem → profiles → storage (upload/download) → bundle subm
 2. **Phase 3 (filesystem)** and **Phase 4 (caches)** can be done in parallel ✅ DONE
 3. **Phase 5 (profiles)** ✅ DONE
 4. **Phase 6 (storage)** - Upload/download orchestration and CRT backend ✅ DONE
-5. **Phase 7 (job submission)** - Next up
-6. **Phase 8 (integration)** - Composes everything together
+5. **Phase 7 (ja-deadline-utils)** - Job submission conversion types
+6. **Phase 8 (ja-deadline-utils)** - Bundle submit and worker sync integration
 
 ---
 
@@ -235,4 +254,4 @@ common → filesystem → profiles → storage (upload/download) → bundle subm
 - [storage-profiles.md](../storage-profiles.md) - Storage profile design
 - [storage-design.md](../storage-design.md) - Upload/download design
 - [manifest-storage.md](../manifest-storage.md) - Manifest S3 operations
-- [job-submission.md](../job-submission.md) - Job attachments format
+- [job-submission.md](../job-submission.md) - ja-deadline-utils crate design

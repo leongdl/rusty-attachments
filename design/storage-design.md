@@ -1,5 +1,7 @@
 # Rusty Attachments: Storage Module Design
 
+**Status: ✅ IMPLEMENTED** - See `crates/storage/` and `crates/storage-crt/`
+
 ## Overview
 
 This document outlines the design for a platform-agnostic storage abstraction layer that enables upload and download operations to S3 Content-Addressable Storage (CAS). The design supports two backend implementations:
