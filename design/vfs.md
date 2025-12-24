@@ -176,6 +176,14 @@ pub const ROOT_INODE: INodeId = 1;
 
 pub enum INodeType { File, Directory, Symlink }
 
+/// File content source - handles both V1 (single hash) and V2 (chunked) files.
+pub enum FileContent {
+    /// Single hash for entire file (V1 and small V2 files).
+    SingleHash(String),
+    /// Chunk hashes for large V2 files (>256MB).
+    Chunked(Vec<String>),
+}
+
 pub struct INodeFile {
     id: INodeId,
     parent_id: INodeId,
@@ -183,9 +191,9 @@ pub struct INodeFile {
     path: String,
     size: u64,
     mtime: SystemTime,
-    hash: String,              // Content hash for CAS lookup
+    content: FileContent,      // Single hash or chunk hashes
     hash_algorithm: HashAlgorithm,
-    executable: bool,
+    executable: bool,          // V2 only (runnable flag)
 }
 
 pub struct INodeDir {
@@ -201,7 +209,149 @@ pub struct INodeSymlink {
     parent_id: INodeId,
     name: String,
     path: String,
-    target: String,            // Symlink target path
+    target: String,            // Symlink target path (V2 only)
+}
+```
+
+### Manifest Version Compatibility
+
+The VFS must handle both V1 (v2023-03-03) and V2 (v2025-12-04-beta) manifests gracefully.
+
+| Feature | V1 (v2023-03-03) | V2 (v2025-12-04-beta) | VFS Handling |
+|---------|------------------|----------------------|--------------|
+| **Files** | `hash`, `size`, `mtime` | Same + optional `chunkhashes` | `FileContent` enum |
+| **Directories** | Implicit (from paths) | Explicit `dirs` array | Build from paths (V1) or use dirs (V2) |
+| **Symlinks** | Not supported | `symlink_target` field | Skip in V1, create `INodeSymlink` in V2 |
+| **Executable** | Not supported | `runnable` field | Default `false` for V1 |
+| **Chunking** | Not supported | Files >256MB use `chunkhashes` | Single hash for V1, chunk-aware reads for V2 |
+| **Deleted entries** | Not supported | `deleted` flag (diff manifests) | Filter out deleted entries |
+
+#### Building INodes from Manifest
+
+```rust
+impl INodeManager {
+    /// Build INode tree from V1 manifest.
+    pub fn from_v1_manifest(&mut self, manifest: &v2023_03_03::AssetManifest) {
+        for entry in &manifest.paths {
+            // V1: All entries are files with single hash
+            // No symlinks, no executable bit, no chunking
+            self.add_file_from_v1(entry);
+        }
+    }
+
+    /// Build INode tree from V2 manifest.
+    pub fn from_v2_manifest(&mut self, manifest: &v2025_12_04::AssetManifest) {
+        // Create explicit directories first
+        for dir in &manifest.dirs {
+            if !dir.deleted {
+                self.add_directory_from_path(&dir.path);
+            }
+        }
+
+        for entry in &manifest.paths {
+            // Skip deleted entries
+            if entry.deleted {
+                continue;
+            }
+
+            if let Some(ref target) = entry.symlink_target {
+                // V2 symlink
+                self.add_symlink_from_v2(entry, target);
+            } else if let Some(ref chunkhashes) = entry.chunkhashes {
+                // V2 chunked file (>256MB)
+                self.add_chunked_file_from_v2(entry, chunkhashes);
+            } else {
+                // V2 regular file (or small file with single hash)
+                self.add_file_from_v2(entry);
+            }
+        }
+    }
+}
+```
+
+#### Permission Mapping
+
+```rust
+impl INodeFile {
+    /// Get FUSE permissions for this file.
+    pub fn permissions(&self) -> u16 {
+        if self.executable {
+            0o755  // rwxr-xr-x (V2 runnable)
+        } else {
+            0o644  // rw-r--r-- (default)
+        }
+    }
+}
+
+impl INodeSymlink {
+    /// Symlinks always have 0o777 permissions (target determines access).
+    pub fn permissions(&self) -> u16 {
+        0o777
+    }
+}
+```
+
+#### Chunked File Read Handling
+
+```rust
+impl DeadlineVfs {
+    /// Read from a file, handling both single-hash and chunked files.
+    async fn read_file(
+        &self,
+        file: &INodeFile,
+        offset: u64,
+        size: u32,
+    ) -> Result<Vec<u8>, VfsError> {
+        match &file.content {
+            FileContent::SingleHash(hash) => {
+                // V1 or small V2 file: single block
+                let key = BlockKey::single(hash);
+                let handle = self.pool.acquire(&key, || self.fetch(hash)).await?;
+                Ok(handle.data()[offset as usize..][..size as usize].to_vec())
+            }
+            FileContent::Chunked(chunkhashes) => {
+                // V2 large file: may span multiple chunks
+                self.read_chunked(file, chunkhashes, offset, size).await
+            }
+        }
+    }
+
+    /// Read from a chunked file, potentially spanning multiple 256MB chunks.
+    async fn read_chunked(
+        &self,
+        file: &INodeFile,
+        chunkhashes: &[String],
+        offset: u64,
+        size: u32,
+    ) -> Result<Vec<u8>, VfsError> {
+        let chunk_size = CHUNK_SIZE_V2;
+        let start_chunk = (offset / chunk_size) as usize;
+        let end_chunk = ((offset + size as u64 - 1) / chunk_size) as usize;
+
+        let mut result = Vec::with_capacity(size as usize);
+
+        for chunk_idx in start_chunk..=end_chunk {
+            let chunk_hash = &chunkhashes[chunk_idx];
+            let key = BlockKey::new(chunk_hash, chunk_idx as u32);
+            let handle = self.pool.acquire(&key, || self.fetch(chunk_hash)).await?;
+
+            let chunk_start = chunk_idx as u64 * chunk_size;
+            let read_start = if chunk_idx == start_chunk {
+                (offset - chunk_start) as usize
+            } else {
+                0
+            };
+            let read_end = if chunk_idx == end_chunk {
+                ((offset + size as u64) - chunk_start) as usize
+            } else {
+                handle.len()
+            };
+
+            result.extend_from_slice(&handle.data()[read_start..read_end]);
+        }
+
+        Ok(result)
+    }
 }
 ```
 
