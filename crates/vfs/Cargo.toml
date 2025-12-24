@@ -1,0 +1,26 @@
+[package]
+name = "rusty-attachments-vfs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "FUSE-based virtual filesystem for Deadline Cloud job attachments"
+
+[features]
+default = []
+fuse = ["dep:fuser"]
+
+[dependencies]
+async-trait = "0.1"
+fuser = { version = "0.14", optional = true }
+futures = "0.3"
+thiserror = "1.0"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
+
+# Internal crates
+rusty-attachments-common = { path = "../common" }
+rusty-attachments-model = { path = "../model" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

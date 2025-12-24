@@ -143,6 +143,7 @@ let session = fuser::spawn_mount2(filesystem, "/mnt/vfs", &[MountOption::RO])?;
 crates/vfs/src/
 ├── lib.rs
 ├── error.rs              # VfsError enum
+├── memory_pool.rs        # Layer 1: Memory pool for V2 chunks
 │
 ├── inode/                # Layer 1: INode primitives
 │   ├── mod.rs
@@ -245,6 +246,189 @@ pub struct CachedStore<S: FileStore> {
     max_size: u64,
 }
 ```
+
+### Memory Pool
+
+The memory pool manages fixed-size blocks (256MB, matching V2 chunk size) with LRU eviction.
+Designed for efficient handling of V2 manifest chunks where large files are split into
+individually-hashed chunks.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      MemoryPool                                  │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │  blocks: HashMap<BlockId, Arc<PoolBlock>>               │    │
+│  │  key_index: HashMap<BlockKey, BlockId>                  │    │
+│  │  pending_fetches: HashMap<BlockKey, Shared<Future>>     │    │
+│  │  lru_order: VecDeque<BlockId>  (front=oldest)           │    │
+│  │  current_size / max_size                                │    │
+│  └─────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────┘
+
+PoolBlock:
+  - data: Arc<Vec<u8>>  (shared, lock-free reads)
+  - key: BlockKey
+  - ref_count: AtomicUsize
+```
+
+#### Core Types
+
+```rust
+/// Key identifying a unique block (hash + chunk_index).
+pub struct BlockKey {
+    pub hash: String,
+    pub chunk_index: u32,
+}
+
+/// Configuration for the memory pool.
+pub struct MemoryPoolConfig {
+    pub max_size: u64,    // Default: 8GB
+    pub block_size: u64,  // Default: 256MB (CHUNK_SIZE_V2)
+}
+
+/// RAII handle - holds Arc to data, auto-releases on drop.
+pub struct BlockHandle {
+    data: Arc<Vec<u8>>,   // Direct access, no lock needed
+    pool: Arc<...>,       // For ref_count decrement on drop
+    block_id: BlockId,
+}
+
+/// Trait for content providers (S3, disk, etc.).
+#[async_trait]
+pub trait BlockContentProvider: Send + Sync {
+    async fn fetch(&self, key: &BlockKey) -> Result<Vec<u8>, MemoryPoolError>;
+}
+```
+
+### VFS Options
+
+Configuration for VFS behavior including caching, prefetching, and performance tuning.
+
+```rust
+/// Main configuration struct for the VFS.
+pub struct VfsOptions {
+    pub pool: MemoryPoolConfig,       // Memory pool settings
+    pub prefetch: PrefetchStrategy,   // Chunk prefetch behavior
+    pub kernel_cache: KernelCacheOptions,
+    pub read_ahead: ReadAheadOptions,
+    pub timeouts: TimeoutOptions,
+}
+
+/// Strategy for prefetching chunks.
+pub enum PrefetchStrategy {
+    /// No prefetching - lazy load on read (default).
+    None,
+    /// Prefetch first N chunks on file open.
+    OnOpen { chunks: u32 },
+    /// Prefetch next chunk during sequential reads.
+    Sequential { look_ahead: u32 },
+    /// Prefetch all chunks on open (use with caution).
+    Eager,
+}
+
+/// Kernel-level cache settings (FUSE).
+pub struct KernelCacheOptions {
+    pub enable_page_cache: bool,   // Default: true
+    pub enable_attr_cache: bool,   // Default: true
+    pub attr_timeout_secs: u64,    // Default: 86400 (24h)
+    pub entry_timeout_secs: u64,   // Default: 86400 (24h)
+}
+
+/// Read-ahead behavior for sequential access.
+pub struct ReadAheadOptions {
+    pub detect_sequential: bool,      // Default: true
+    pub sequential_threshold: u32,    // Default: 2 reads
+    pub max_concurrent_prefetch: u32, // Default: 4
+}
+
+/// Timeout settings.
+pub struct TimeoutOptions {
+    pub fetch_timeout_secs: u64,  // Default: 300 (5 min)
+    pub open_timeout_secs: u64,   // Default: 60 (1 min)
+}
+```
+
+#### Usage Example
+
+```rust
+let options = VfsOptions::default()
+    .with_prefetch(PrefetchStrategy::OnOpen { chunks: 2 })
+    .with_pool_config(MemoryPoolConfig::with_max_size(16 * GB))
+    .with_read_ahead(ReadAheadOptions::aggressive());
+
+let vfs = DeadlineVfs::new(manifest, store, options)?;
+fuser::mount2(vfs, "/mnt/assets", &[MountOption::RO])?;
+```
+
+#### Pool Operations
+
+```rust
+impl MemoryPool {
+    /// Create pool with configuration.
+    pub fn new(config: MemoryPoolConfig) -> Self;
+    
+    /// Acquire block, fetching if not cached. Returns RAII handle.
+    /// Uses fetch coordination to prevent duplicate fetches.
+    pub async fn acquire<F, Fut>(&self, key: &BlockKey, fetch: F) 
+        -> Result<BlockHandle, MemoryPoolError>;
+    
+    /// Try to get cached block without fetching.
+    pub fn try_get(&self, key: &BlockKey) -> Option<BlockHandle>;
+    
+    /// Get pool statistics.
+    pub fn stats(&self) -> MemoryPoolStats;
+}
+```
+
+#### Constants
+
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `DEFAULT_MAX_POOL_SIZE` | 8GB | Maximum pool memory |
+| `DEFAULT_BLOCK_SIZE` | 256MB | Block size (matches V2 chunk) |
+
+#### Multi-threaded Access Design
+
+The memory pool is designed for concurrent access from multiple FUSE read operations:
+
+1. **Lock-Free Data Access**: Block data is stored in `Arc<Vec<u8>>`.
+   - `BlockHandle` holds a clone of the Arc
+   - Reading data requires no locks - just dereference the Arc
+   - Multiple readers can access the same block simultaneously
+
+2. **Atomic Reference Counting**: `ref_count` uses `AtomicUsize`.
+   - Increment/decrement without holding pool lock
+   - Blocks with `ref_count > 0` cannot be evicted
+   - `BlockHandle::drop()` decrements atomically
+
+3. **Fetch Coordination**: Prevents thundering herd / duplicate fetches.
+   - `pending_fetches: HashMap<BlockKey, Shared<Future>>` tracks in-flight fetches
+   - First thread to request a key starts the fetch and inserts a shared future
+   - Subsequent threads for the same key await the existing future
+   - After fetch completes, future is removed and block is inserted
+
+   ```
+   Thread A: acquire(key) → cache miss → start fetch, insert pending future
+   Thread B: acquire(key) → cache miss → find pending future → await it
+   Thread C: acquire(key) → cache miss → find pending future → await it
+   [fetch completes]
+   All threads: receive same data, only one S3 request made
+   ```
+
+4. **Lock Granularity**:
+   - Pool metadata protected by `Mutex<MemoryPoolInner>` (not RwLock - mutations are common)
+   - Lock held only for quick HashMap operations
+   - Async fetch happens outside the lock
+   - Data reads are lock-free via Arc
+
+5. **Deadlock Prevention**:
+   - Single lock (no nested locks)
+   - No lock held across await points
+   - Atomic operations for ref_count
+
+6. **Memory Pressure**: When pool is full and all blocks are in use:
+   - Returns `MemoryPoolError::PoolExhausted`
+   - Caller should retry or fail the read operation
 
 ### DeadlineVfs (FUSE Implementation)
 
@@ -356,6 +540,235 @@ rusty-attachments-common = { path = "../common" }
 ## Future Considerations
 
 1. **Chunk-based retrieval** - Use V2 chunk hashes for parallel/partial downloads
-2. **Write support** - Write-back to local cache for temporary files
-3. **Multiple manifests** - Mount multiple manifests as subdirectories
-4. **Windows support** - WinFSP or Dokan integration
+2. **Multiple manifests** - Mount multiple manifests as subdirectories
+3. **Windows support** - WinFSP or Dokan integration
+4. **Memory pool enhancements**:
+   - Sharded locks (`DashMap`) for reduced contention under high concurrency
+   - Prefetching adjacent chunks for sequential read patterns
+   - Tiered eviction (prioritize evicting cold chunks over recently-accessed)
+
+---
+
+## Write Support Design (Future)
+
+The current memory pool is optimized for read-only access. If write support is needed in the future, here's the recommended approach:
+
+### Current Limitations
+
+The read-optimized design has these constraints for writes:
+
+| Aspect | Current Design | Write Limitation |
+|--------|----------------|------------------|
+| Data storage | `Arc<Vec<u8>>` | Immutable once created - shared readers |
+| Block API | `data(&self) -> &[u8]` | Read-only, no `data_mut()` |
+| CAS model | Content identified by hash | Modified data = different hash = different block |
+| Dirty tracking | None | No mechanism to track modified blocks |
+
+### Recommended Approach: Copy-on-Write with Dirty Cache
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      WritableMemoryPool                          │
+│  ┌─────────────────────────────────────────────────────────┐    │
+│  │  read_pool: MemoryPool (existing, immutable)            │    │
+│  │  dirty_blocks: HashMap<BlockKey, DirtyBlock>            │    │
+│  │  write_log: Vec<WriteOperation>                         │    │
+│  └─────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────┘
+
+DirtyBlock:
+  - data: Vec<u8>  (mutable, owned)
+  - original_hash: Option<String>  (for COW tracking)
+  - modified_ranges: Vec<Range<u64>>
+```
+
+### Write Flow
+
+```
+write(key, offset, data):
+  1. Check dirty_blocks for existing dirty copy
+  2. If not dirty:
+     a. Fetch original from read_pool (or S3 if not cached)
+     b. Copy to new Vec<u8> in dirty_blocks (COW)
+  3. Apply write to dirty block
+  4. Track modified range for partial flush optimization
+
+flush(key):
+  1. Compute new hash of dirty block
+  2. Upload to S3 CAS with new hash
+  3. Update manifest entry (new hash, size, mtime)
+  4. Move block to read_pool with new key
+  5. Remove from dirty_blocks
+```
+
+### Read Flow with Dirty Blocks
+
+```
+read(key, offset, size):
+  1. Check dirty_blocks first (dirty data takes precedence)
+  2. If dirty: return from dirty block
+  3. Else: return from read_pool (existing flow)
+```
+
+### Key Design Decisions
+
+1. **Separate dirty cache**: Keep read pool immutable for lock-free reads. Dirty blocks are separate and use standard `Vec<u8>` for mutability.
+
+2. **Copy-on-Write**: Only copy when first write occurs. Reads of unmodified data still use the efficient `Arc<Vec<u8>>` path.
+
+3. **Write-back, not write-through**: Buffer writes locally, flush on `fsync()` or `release()`. Reduces S3 round-trips.
+
+4. **New hash on flush**: Since CAS uses content hashes, modified blocks get new hashes. Original blocks remain valid for other readers.
+
+### Alternative Approaches (Not Recommended)
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| `Arc<RwLock<Vec<u8>>>` | Simple API | Lock overhead on every read |
+| In-place mutation | No copy | Breaks shared readers, unsafe |
+| Write-through | Simple consistency | High latency, many S3 calls |
+
+
+---
+
+## Fus3 vs Rust VFS: File Open/Read/Close Flow Comparison
+
+This section traces through the file lifecycle in both implementations to identify differences and potential performance implications.
+
+### Fus3 (C++) Flow
+
+```
+Thread A: open("/file.txt")
+├─ HandleOpen(ino)
+│  ├─ GetINode(ino) → iNode
+│  └─ OpenObject(iNode, isOpen=true, createNotExists=false)
+│     ├─ LOCK(m_openFileMutex)
+│     ├─ Check m_openFileINodeMap[ino] → miss
+│     ├─ Check m_pendingOpenFileINodeMap[ino] → miss
+│     ├─ Create OpenFileInfo, add to m_pendingOpenFileINodeMap
+│     ├─ LOCK(fileBuffer.bufferMutex) ← held during download
+│     ├─ UNLOCK(m_openFileMutex)
+│     ├─ m_fileStorage->Retrieve() or GetFileInfoFromBucket()
+│     │  └─ S3 GetObject (blocking, ~100ms-10s)
+│     ├─ TransferComplete()
+│     │  ├─ LOCK(m_openFileMutex)
+│     │  ├─ Move from pending → openFileINodeMap
+│     │  ├─ UNLOCK(m_openFileMutex)
+│     │  └─ SetOpen() → notify waiters
+│     └─ UNLOCK(fileBuffer.bufferMutex)
+└─ Return file handle
+
+Thread B: open("/file.txt") [while Thread A downloading]
+├─ HandleOpen(ino)
+│  └─ OpenObject(iNode)
+│     ├─ LOCK(m_openFileMutex)
+│     ├─ Check m_openFileINodeMap[ino] → miss
+│     ├─ Check m_pendingOpenFileINodeMap[ino] → HIT!
+│     ├─ UNLOCK(m_openFileMutex)
+│     ├─ WaitForOpen() ← blocks until Thread A completes
+│     ├─ Check IsInitialized() → true
+│     ├─ IncrementHandleCount()
+│     └─ Return same OpenFileInfo
+└─ Return file handle (same underlying buffer)
+```
+
+**Key Fus3 Characteristics:**
+- Per-file `OpenFileInfo` with handle count (multiple opens share one buffer)
+- `m_pendingOpenFileINodeMap` for in-flight downloads
+- `WaitForOpen()` blocks concurrent openers until download completes
+- Single S3 request per file, regardless of concurrent opens
+- Buffer mutex held during entire download
+
+### Proposed Rust VFS Flow
+
+```
+Thread A: open("/file.txt")
+├─ lookup(parent, "file.txt") → ino
+├─ open(ino) → create OpenHandle, return fh
+└─ [no download yet - lazy]
+
+Thread A: read(ino, fh, offset=0, size=256MB)
+├─ Get chunk_key from INode (hash + chunk_index)
+├─ pool.acquire(&chunk_key, fetch_fn)
+│  ├─ LOCK(pool.inner)
+│  ├─ Check key_index → miss
+│  ├─ Check pending_fetches → miss
+│  ├─ Insert shared future into pending_fetches
+│  ├─ UNLOCK(pool.inner)
+│  ├─ fetch_fn() → S3 GetObject (async, ~100ms-10s)
+│  ├─ LOCK(pool.inner)
+│  ├─ Remove from pending_fetches
+│  ├─ Insert block, acquire ref
+│  ├─ UNLOCK(pool.inner)
+│  └─ Return BlockHandle
+└─ Return data slice
+
+Thread B: read(ino, fh, offset=0, size=256MB) [while Thread A downloading]
+├─ pool.acquire(&chunk_key, fetch_fn)
+│  ├─ LOCK(pool.inner)
+│  ├─ Check key_index → miss
+│  ├─ Check pending_fetches → HIT!
+│  ├─ Clone shared future
+│  ├─ UNLOCK(pool.inner)
+│  ├─ await shared_future ← waits for Thread A
+│  ├─ LOCK(pool.inner)
+│  ├─ Lookup block, acquire ref
+│  ├─ UNLOCK(pool.inner)
+│  └─ Return BlockHandle
+└─ Return data slice
+```
+
+### Key Differences
+
+| Aspect | Fus3 (C++) | Rust VFS |
+|--------|------------|----------|
+| **Download trigger** | `open()` - eager | `read()` - lazy |
+| **Granularity** | Per-file buffer | Per-chunk (256MB blocks) |
+| **Concurrent open handling** | `WaitForOpen()` on pending map | Shared future in `pending_fetches` |
+| **Data sharing** | Single `OpenFileInfo` per file | `Arc<Vec<u8>>` per chunk |
+| **Lock during download** | Buffer mutex held | No lock held (async) |
+| **Handle model** | Handle count on `OpenFileInfo` | Separate `BlockHandle` per acquire |
+
+### Performance Implications
+
+**Advantages of Rust Design:**
+
+1. **Lazy download**: Files opened but never read don't trigger S3 requests. Fus3 downloads on open even if file is never read.
+
+2. **Chunk-level caching**: For V2 manifests, only accessed chunks are downloaded. A 10GB file with 40 chunks only downloads the chunks actually read.
+
+3. **No lock during download**: Fus3 holds `bufferMutex` during the entire S3 download. Rust releases the pool lock before async fetch.
+
+4. **Better parallelism for large files**: Multiple chunks of the same file can be fetched in parallel by different threads.
+
+**Potential Disadvantages:**
+
+1. **More S3 requests for small files**: Fus3 downloads entire file once. If Rust VFS reads a small file in multiple `read()` calls, it's still one chunk, but the lazy approach means the first read has full latency.
+
+2. **No prefetching**: Fus3's eager download means data is ready when `read()` is called. Rust's lazy approach means first `read()` always waits.
+
+3. **Chunk boundary overhead**: Reading across chunk boundaries requires acquiring multiple blocks.
+
+### Recommended Enhancements
+
+1. **Prefetch on open (optional)**: Add a config option to prefetch first N chunks on `open()` for latency-sensitive workloads.
+
+2. **Sequential read detection**: If reads are sequential, prefetch next chunk while current chunk is being read.
+
+3. **Small file optimization**: For files < 256MB (single chunk), behavior is equivalent to Fus3.
+
+```rust
+// Optional prefetch on open
+fn open(&mut self, ino: u64, flags: i32) -> Result<OpenHandle> {
+    let handle = self.create_handle(ino, flags)?;
+    
+    if self.config.prefetch_on_open {
+        let file = self.inodes.get(ino)?;
+        let first_chunk = BlockKey::new(&file.hash, 0);
+        // Fire-and-forget prefetch
+        tokio::spawn(self.pool.acquire(&first_chunk, || self.fetch_chunk(&first_chunk)));
+    }
+    
+    Ok(handle)
+}
+```

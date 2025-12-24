@@ -9,6 +9,7 @@ members = [
     "crates/storage",
     "crates/storage-crt",
     "crates/python",
+    "crates/vfs",
     "crates/wasm",
 ]
 
