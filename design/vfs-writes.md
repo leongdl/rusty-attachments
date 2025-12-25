@@ -4016,6 +4016,110 @@ This separation keeps the library focused on data collection while the CLI handl
 
 ---
 
+## Implementation Notes
+
+### New File Visibility (create/lookup/getattr)
+
+New files created via `create()` are stored only in `DirtyFileManager`, not in `INodeManager` (which holds manifest files). This requires special handling in FUSE operations:
+
+| Operation | Issue | Solution |
+|-----------|-------|----------|
+| `readdir()` | New files not listed | Call `dirty_manager.get_new_files_in_dir(parent)` and append to entries |
+| `lookup()` | Returns ENOENT for new files | Check `dirty_manager.lookup_new_file(parent, name)` after manifest lookup |
+| `getattr()` | Returns ENOENT for new file inodes | Check `dirty_manager.is_new_file(ino)` and build attrs from dirty state |
+| `open()` | Returns ENOENT for new files | Check `dirty_manager.is_new_file(ino)` before manifest lookup |
+| `setattr()` | Fails for new files | Check `dirty_manager.is_new_file(ino)` and build attrs from dirty state |
+
+#### DirtyFile Parent Tracking
+
+`DirtyFile` includes `parent_inode: Option<INodeId>` to track which directory contains new files:
+
+```rust
+pub struct DirtyFile {
+    // ...existing fields...
+    /// Parent inode ID (only set for new files).
+    parent_inode: Option<INodeId>,
+}
+
+impl DirtyFile {
+    /// Create a new file (not from COW).
+    pub fn new_file(inode_id: INodeId, rel_path: String, parent_inode: INodeId) -> Self;
+    
+    /// Get parent inode ID (only set for new files).
+    pub fn parent_inode(&self) -> Option<INodeId>;
+    
+    /// Get the file name (last component of path).
+    pub fn file_name(&self) -> &str;
+}
+```
+
+#### DirtyFileManager Lookup Methods
+
+```rust
+impl DirtyFileManager {
+    /// Look up a new file by parent inode and name.
+    pub fn lookup_new_file(&self, parent_inode: INodeId, name: &str) -> Option<INodeId>;
+    
+    /// Check if an inode is a new file (created, not from manifest).
+    pub fn is_new_file(&self, inode_id: INodeId) -> bool;
+    
+    /// Get new files in a directory.
+    pub fn get_new_files_in_dir(&self, parent_inode: INodeId) -> Vec<(INodeId, String)>;
+}
+```
+
+### Deleting New Files (unlink)
+
+When deleting files, behavior differs based on file origin:
+
+| File Type | Behavior |
+|-----------|----------|
+| Manifest file (existing) | Mark as `DirtyState::Deleted` in dirty map |
+| New file (created this session) | Remove entirely from dirty map |
+
+The `unlink()` implementation must check both sources:
+
+```rust
+fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+    // ... name validation ...
+    
+    // Find inode - check manifest files first, then new files
+    let ino: u64 = if let Some(inode) = self.inodes.get_by_path(&file_path) {
+        inode.id()
+    } else if let Some(new_ino) = self.dirty_manager.lookup_new_file(parent, name_str) {
+        new_ino
+    } else {
+        reply.error(libc::ENOENT);
+        return;
+    };
+    
+    // delete_file() handles both cases appropriately
+    self.dirty_manager.delete_file(ino).await?;
+    reply.ok();
+}
+```
+
+The `delete_file()` method handles both cases:
+
+```rust
+pub async fn delete_file(&self, inode_id: INodeId) -> Result<(), VfsError> {
+    // New files: remove entirely (they never existed in manifest)
+    if self.is_new_file(inode_id) {
+        let rel_path: Option<String> = /* get path from dirty file */;
+        self.dirty_files.write().unwrap().remove(&inode_id);
+        if let Some(path) = rel_path {
+            let _ = self.cache.delete_file(&path).await;
+        }
+        return Ok(());
+    }
+    
+    // Manifest files: mark as deleted (need to track for diff manifest)
+    // ... existing logic ...
+}
+```
+
+---
+
 ## Related Documents
 
 - [vfs.md](vfs.md) - Read-only VFS design (base implementation)

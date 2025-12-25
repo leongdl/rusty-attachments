@@ -1024,10 +1024,31 @@ impl DirtyFileManager {
 
     /// Mark a file as deleted.
     ///
+    /// For new files (created in this session), removes them entirely.
+    /// For manifest files, marks them as deleted.
+    ///
     /// # Arguments
     /// * `inode_id` - Inode ID of file to delete
     pub async fn delete_file(&self, inode_id: INodeId) -> Result<(), VfsError> {
-        // If not dirty, create a deleted entry
+        // Check if it's a new file - if so, just remove it entirely
+        if self.is_new_file(inode_id) {
+            let rel_path: Option<String> = {
+                let guard = self.dirty_files.read().unwrap();
+                guard.get(&inode_id).map(|f| f.rel_path().to_string())
+            };
+
+            // Remove from dirty map
+            self.dirty_files.write().unwrap().remove(&inode_id);
+
+            // Remove from disk cache if it was written
+            if let Some(path) = rel_path {
+                let _ = self.cache.delete_file(&path).await;
+            }
+
+            return Ok(());
+        }
+
+        // If not dirty, create a deleted entry for manifest file
         if !self.is_dirty(inode_id) {
             let inode: Arc<dyn INode> = self
                 .inodes

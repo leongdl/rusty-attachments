@@ -474,8 +474,9 @@ mod delete {
 
         manager.delete_file(100).await.unwrap();
 
-        assert!(manager.is_dirty(100));
-        assert_eq!(manager.get_state(100), Some(DirtyState::Deleted));
+        // New files are removed entirely when deleted, not marked as deleted
+        assert!(!manager.is_dirty(100));
+        assert_eq!(manager.get_state(100), None);
     }
 
     #[tokio::test]
@@ -942,14 +943,25 @@ mod cache_integration {
 
     #[tokio::test]
     async fn test_flush_deleted_file() {
-        let (manager, _inodes, _store) = create_test_env();
+        let (manager, inodes, store) = create_test_env();
 
-        manager.create_file(100, "test.txt".to_string(), 1).unwrap();
-        manager.write(100, 0, b"hello").await.unwrap();
-        manager.delete_file(100).await.unwrap();
+        // Use an existing manifest file for this test (new files are removed on delete)
+        let original: Vec<u8> = b"original".to_vec();
+        store.insert("orig_hash", original);
+
+        let ino: u64 = inodes.add_file(
+            "test.txt",
+            8,
+            0,
+            FileContent::SingleHash("orig_hash".to_string()),
+            HashAlgorithm::Xxh128,
+            false,
+        );
+
+        manager.delete_file(ino).await.unwrap();
 
         // Flush deleted file should succeed
-        manager.flush_to_disk(100).await.unwrap();
+        manager.flush_to_disk(ino).await.unwrap();
     }
 
     #[tokio::test]

@@ -719,16 +719,17 @@ mod impl_fuse {
                 format!("{}/{}", parent_path, name_str)
             };
 
-            // Find inode
-            let ino: u64 = match self.inodes.get_by_path(&file_path) {
-                Some(inode) => inode.id(),
-                None => {
-                    reply.error(libc::ENOENT);
-                    return;
-                }
+            // Find inode - check manifest files first, then new files
+            let ino: u64 = if let Some(inode) = self.inodes.get_by_path(&file_path) {
+                inode.id()
+            } else if let Some(new_ino) = self.dirty_manager.lookup_new_file(parent, name_str) {
+                new_ino
+            } else {
+                reply.error(libc::ENOENT);
+                return;
             };
 
-            // Mark as deleted
+            // Mark as deleted (or remove if new file)
             let rt: Handle = self.runtime.clone();
             let dm: Arc<DirtyFileManager> = self.dirty_manager.clone();
 
