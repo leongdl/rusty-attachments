@@ -901,6 +901,11 @@ impl DirtySummary {
 
 ### Export Implementation
 
+The diff manifest export must handle chunked files correctly. A modified chunked file needs:
+1. Full file assembly (dirty + unmodified chunks)
+2. New hash of the complete content
+3. The assembled file stored for CAS upload
+
 ```rust
 impl DiffManifestExporter for WritableVfs {
     async fn export_diff_manifest(
@@ -908,9 +913,8 @@ impl DiffManifestExporter for WritableVfs {
         parent_manifest: &Manifest,
         parent_encoded: &str,
     ) -> Result<Manifest, VfsError> {
-        use rusty_attachments_common::hash_data;
+        use rusty_attachments_common::{hash_data, hash_string};
         use rusty_attachments_model::{
-            diff::create_diff_manifest,
             v2025_12_04::{AssetManifest, ManifestDirectoryPath, ManifestFilePath},
             HashAlgorithm, ManifestType, ManifestVersion,
         };
@@ -930,60 +934,43 @@ impl DiffManifestExporter for WritableVfs {
 
         for entry in dirty_entries {
             match entry.state {
-                DirtyState::New | DirtyState::Modified => {
-                    // Read current data from cache for hashing
-                    let data: Vec<u8> = self.dirty_manager.cache
-                        .read_file(&entry.path)?
-                        .ok_or_else(|| VfsError::CacheReadFailed(entry.path.clone()))?;
-
-                    // Compute hash of current content
-                    let hash: String = hash_data(&data, HashAlgorithm::Xxh128);
-
-                    // Convert mtime to microseconds since epoch
-                    let mtime_us: i64 = entry.mtime
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_micros() as i64)
-                        .unwrap_or(0);
-
-                    files.push(ManifestFilePath {
-                        path: entry.path.clone(),
-                        hash: Some(hash),
-                        size: Some(entry.size),
-                        mtime: Some(mtime_us),
-                        runnable: entry.executable,
-                        chunkhashes: None, // TODO: chunk large files
-                        symlink_target: None,
-                        deleted: false,
-                    });
-
-                    total_size += entry.size;
-
-                    // Track parent directories
-                    let mut current: &str = &entry.path;
-                    while let Some(idx) = current.rfind('/') {
-                        let dir: &str = &current[..idx];
-                        if seen_dirs.insert(dir.to_string()) {
-                            // Check if this is a new directory
-                            if !self.original_dirs.contains(dir) {
-                                dirs.push(ManifestDirectoryPath {
-                                    path: dir.to_string(),
-                                    deleted: false,
-                                });
-                            }
-                        }
-                        current = dir;
-                    }
+                DirtyState::New => {
+                    // New file - must hash entire content
+                    let file_entry: ManifestFilePath = self.hash_new_file(&entry).await?;
+                    total_size += file_entry.size.unwrap_or(0);
+                    files.push(file_entry);
+                }
+                DirtyState::Modified => {
+                    // Modified file - reuse unmodified chunk hashes
+                    let file_entry: ManifestFilePath = self.hash_modified_file(&entry).await?;
+                    total_size += file_entry.size.unwrap_or(0);
+                    files.push(file_entry);
                 }
                 DirtyState::Deleted => {
                     files.push(ManifestFilePath::deleted(&entry.path));
+                    continue; // Skip directory tracking for deleted files
                 }
+            }
+
+            // Track parent directories for new/modified files
+            let mut current: &str = &entry.path;
+            while let Some(idx) = current.rfind('/') {
+                let dir: &str = &current[..idx];
+                if seen_dirs.insert(dir.to_string()) {
+                    if !self.original_dirs.contains(dir) {
+                        dirs.push(ManifestDirectoryPath {
+                            path: dir.to_string(),
+                            deleted: false,
+                        });
+                    }
+                }
+                current = dir;
             }
         }
 
         // Check for deleted directories
         for dir in &self.original_dirs {
             if !seen_dirs.contains(dir.as_str()) {
-                // Directory no longer has any files - mark as deleted
                 dirs.push(ManifestDirectoryPath::deleted(dir));
             }
         }
@@ -998,6 +985,375 @@ impl DiffManifestExporter for WritableVfs {
             parent_manifest_hash: Some(parent_hash),
         }))
     }
+
+impl WritableVfs {
+    /// Hash a new file (not from original manifest).
+    ///
+    /// # Arguments
+    /// * `entry` - Dirty entry for the new file
+    async fn hash_new_file(&self, entry: &DirtyEntry) -> Result<ManifestFilePath, VfsError> {
+        let data: Vec<u8> = self.dirty_manager.cache
+            .read_file(&entry.path).await?
+            .ok_or_else(|| VfsError::CacheReadFailed(entry.path.clone()))?;
+
+        let mtime_us: i64 = to_mtime_micros(entry.mtime);
+
+        // Check if file needs chunking
+        if data.len() as u64 > CHUNK_SIZE_V2 {
+            let chunkhashes: Vec<String> = compute_chunk_hashes(&data);
+            Ok(ManifestFilePath {
+                path: entry.path.clone(),
+                hash: None, // Chunked files don't have single hash
+                size: Some(entry.size),
+                mtime: Some(mtime_us),
+                runnable: entry.executable,
+                chunkhashes: Some(chunkhashes),
+                symlink_target: None,
+                deleted: false,
+            })
+        } else {
+            let hash: String = hash_data(&data, HashAlgorithm::Xxh128);
+            Ok(ManifestFilePath {
+                path: entry.path.clone(),
+                hash: Some(hash),
+                size: Some(entry.size),
+                mtime: Some(mtime_us),
+                runnable: entry.executable,
+                chunkhashes: None,
+                symlink_target: None,
+                deleted: false,
+            })
+        }
+    }
+
+    /// Hash a modified file, reusing original chunk hashes where possible.
+    ///
+    /// For chunked files, only dirty chunks are re-hashed. Unmodified chunks
+    /// retain their original hashes from the manifest - NO DOWNLOAD NEEDED.
+    ///
+    /// # Arguments
+    /// * `entry` - Dirty entry for the modified file
+    async fn hash_modified_file(&self, entry: &DirtyEntry) -> Result<ManifestFilePath, VfsError> {
+        let dirty_file = self.dirty_manager.get(entry.inode_id)
+            .ok_or(VfsError::InodeNotFound(entry.inode_id))?;
+
+        let mtime_us: i64 = to_mtime_micros(entry.mtime);
+
+        match &dirty_file.content {
+            DirtyContent::Small { data } => {
+                // Small file - hash entire content
+                let hash: String = hash_data(data, HashAlgorithm::Xxh128);
+                Ok(ManifestFilePath {
+                    path: entry.path.clone(),
+                    hash: Some(hash),
+                    size: Some(data.len() as u64),
+                    mtime: Some(mtime_us),
+                    runnable: entry.executable,
+                    chunkhashes: None,
+                    symlink_target: None,
+                    deleted: false,
+                })
+            }
+            DirtyContent::Chunked {
+                original_chunks,
+                dirty_chunks,
+                loaded_chunks,
+                total_size,
+                ..
+            } => {
+                // Large file - only hash dirty chunks, reuse original hashes
+                let mut new_chunkhashes: Vec<String> = Vec::with_capacity(original_chunks.len());
+
+                for (chunk_idx, original_hash) in original_chunks.iter().enumerate() {
+                    let chunk_idx: u32 = chunk_idx as u32;
+
+                    if dirty_chunks.contains(&chunk_idx) {
+                        // Dirty chunk - must re-hash from loaded data
+                        let chunk_data: &[u8] = loaded_chunks.get(&chunk_idx)
+                            .ok_or_else(|| VfsError::ChunkNotLoaded {
+                                path: entry.path.clone(),
+                                chunk_index: chunk_idx,
+                            })?;
+                        let new_hash: String = hash_data(chunk_data, HashAlgorithm::Xxh128);
+                        new_chunkhashes.push(new_hash);
+                    } else {
+                        // Unmodified chunk - REUSE ORIGINAL HASH (no download!)
+                        new_chunkhashes.push(original_hash.clone());
+                    }
+                }
+
+                Ok(ManifestFilePath {
+                    path: entry.path.clone(),
+                    hash: None,
+                    size: Some(*total_size),
+                    mtime: Some(mtime_us),
+                    runnable: entry.executable,
+                    chunkhashes: Some(new_chunkhashes),
+                    symlink_target: None,
+                    deleted: false,
+                })
+            }
+        }
+    }
+}
+
+/// Compute chunk hashes for data.
+fn compute_chunk_hashes(data: &[u8]) -> Vec<String> {
+    let chunk_size: usize = CHUNK_SIZE_V2 as usize;
+    data.chunks(chunk_size)
+        .map(|chunk| hash_data(chunk, HashAlgorithm::Xxh128))
+        .collect()
+}
+
+/// Convert SystemTime to microseconds since epoch.
+fn to_mtime_micros(time: SystemTime) -> i64 {
+    time.duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0)
+}
+```
+
+### Diff Manifest Export: Chunk Hash Optimization
+
+For a 2GB file (8 chunks) where only chunk 4 was modified:
+
+| Chunk | Original Hash | Action | New Hash |
+|-------|---------------|--------|----------|
+| 0 | `abc123...` | **Reuse** | `abc123...` |
+| 1 | `def456...` | **Reuse** | `def456...` |
+| 2 | `ghi789...` | **Reuse** | `ghi789...` |
+| 3 | `jkl012...` | **Reuse** | `jkl012...` |
+| 4 | `mno345...` | **Re-hash** | `xyz999...` |
+| 5 | `pqr678...` | **Reuse** | `pqr678...` |
+| 6 | `stu901...` | **Reuse** | `stu901...` |
+| 7 | `vwx234...` | **Reuse** | `vwx234...` |
+
+**Result**: Only 1 chunk hashed (already in memory), 7 chunks reuse original hashes. No S3 downloads needed for unmodified chunks during export.
+
+    // ... other methods ...
+}
+
+impl WritableVfs {
+    /// Assemble full file content from sparse chunks and compute hash.
+    ///
+    /// For chunked files, this fetches any unloaded chunks from S3,
+    /// combines with dirty chunks, writes the assembled file to the
+    /// materialized cache, and returns the full content with its hash.
+    ///
+    /// # Arguments
+    /// * `inode_id` - Inode ID of the dirty file
+    ///
+    /// # Returns
+    /// Tuple of (assembled_data, xxh128_hash)
+    async fn assemble_and_hash_file(
+        &self,
+        inode_id: INodeId,
+    ) -> Result<(Vec<u8>, String), VfsError> {
+        let guard = self.dirty_manager.dirty_files.read().unwrap();
+        let dirty: &DirtyFile = guard.get(&inode_id)
+            .ok_or(VfsError::InodeNotFound(inode_id))?;
+
+        let assembled: Vec<u8> = match &dirty.content {
+            DirtyContent::Small { data } => {
+                data.clone()
+            }
+            DirtyContent::Chunked {
+                original_chunks,
+                chunk_size,
+                total_size,
+                loaded_chunks,
+                dirty_chunks: _,
+            } => {
+                // Assemble full file from chunks
+                let mut data: Vec<u8> = Vec::with_capacity(*total_size as usize);
+
+                for (chunk_idx, chunk_hash) in original_chunks.iter().enumerate() {
+                    let chunk_idx: u32 = chunk_idx as u32;
+
+                    let chunk_data: Vec<u8> = if let Some(loaded) = loaded_chunks.get(&chunk_idx) {
+                        // Use loaded (possibly dirty) chunk
+                        loaded.clone()
+                    } else {
+                        // Fetch unmodified chunk from S3
+                        self.dirty_manager.read_store
+                            .retrieve(chunk_hash, HashAlgorithm::Xxh128)
+                            .await?
+                    };
+
+                    data.extend(chunk_data);
+                }
+
+                data
+            }
+        };
+
+        // Compute hash of full content
+        let hash: String = hash_data(&assembled, HashAlgorithm::Xxh128);
+
+        // Write assembled file to materialized cache for later upload
+        self.dirty_manager.cache
+            .write_file(dirty.rel_path(), &assembled)
+            .await?;
+
+        Ok((assembled, hash))
+    }
+
+    /// Compute chunk hashes for a large file.
+    ///
+    /// # Arguments
+    /// * `data` - Full file content
+    ///
+    /// # Returns
+    /// Vector of xxh128 hashes, one per 256MB chunk.
+    async fn compute_chunk_hashes(&self, data: &[u8]) -> Result<Vec<String>, VfsError> {
+        let chunk_size: usize = CHUNK_SIZE_V2 as usize;
+        let mut hashes: Vec<String> = Vec::new();
+
+        for chunk in data.chunks(chunk_size) {
+            let hash: String = hash_data(chunk, HashAlgorithm::Xxh128);
+            hashes.push(hash);
+        }
+
+        Ok(hashes)
+    }
+}
+```
+
+---
+
+## Diff Manifest Semantics
+
+### What Goes in a Diff Manifest?
+
+A diff manifest contains entries for files that have **changed** relative to the parent:
+
+| Change Type | Diff Entry | CAS Upload Required |
+|-------------|------------|---------------------|
+| New file | Full entry (hash, size, mtime) | Yes - upload new content |
+| Modified file | Full entry with NEW hash | Yes - upload new content |
+| Deleted file | `deleted: true` | No |
+| Unchanged file | **Not included** | No |
+
+### Modified Chunked File
+
+When a chunked file is modified (even just one chunk), the diff manifest entry contains:
+
+```json
+{
+  "path": "large_video.mp4",
+  "hash": "abc123...",           // NEW hash of entire assembled file
+  "size": 2147483648,            // 2GB
+  "mtime": 1703001200000000,
+  "chunkhashes": [               // NEW chunk hashes
+    "chunk0_new_hash",           // May be same as original if unmodified
+    "chunk1_new_hash",
+    "chunk2_new_hash",
+    "chunk3_modified_hash",      // This chunk was modified
+    "chunk4_new_hash",
+    "chunk5_new_hash",
+    "chunk6_new_hash",
+    "chunk7_new_hash"
+  ]
+}
+```
+
+### CAS Upload After Export
+
+After `export_diff_manifest()`, the caller must upload the modified content to S3 CAS:
+
+```rust
+async fn upload_diff_changes(
+    diff: &Manifest,
+    cache: &MaterializedCache,
+    storage: &dyn StorageClient,
+    location: &S3Location,
+) -> Result<(), Error> {
+    for file in diff.files()? {
+        if file.deleted {
+            continue; // Nothing to upload for deletions
+        }
+
+        // Read assembled file from materialized cache
+        let data: Vec<u8> = cache.read_file(&file.path).await?
+            .ok_or(Error::CacheMiss(file.path.clone()))?;
+
+        if let Some(ref chunkhashes) = file.chunkhashes {
+            // Upload each chunk to CAS
+            let chunk_size: usize = CHUNK_SIZE_V2 as usize;
+            for (idx, chunk_hash) in chunkhashes.iter().enumerate() {
+                let start: usize = idx * chunk_size;
+                let end: usize = (start + chunk_size).min(data.len());
+                let chunk: &[u8] = &data[start..end];
+
+                let key: String = location.cas_key(chunk_hash, HashAlgorithm::Xxh128);
+                storage.put_object(&location.bucket, &key, chunk).await?;
+            }
+        } else if let Some(ref hash) = file.hash {
+            // Upload single file to CAS
+            let key: String = location.cas_key(hash, HashAlgorithm::Xxh128);
+            storage.put_object(&location.bucket, &key, &data).await?;
+        }
+    }
+
+    Ok(())
+}
+```
+
+### Chunk Deduplication
+
+Even though we upload all chunks, CAS provides natural deduplication:
+
+- Unmodified chunks have the **same hash** as the original
+- S3 CAS `put_object` can skip if key already exists (or use conditional PUT)
+- Only truly modified chunks result in new S3 objects
+
+```rust
+/// Upload chunk to CAS, skipping if already exists.
+async fn upload_chunk_if_missing(
+    storage: &dyn StorageClient,
+    location: &S3Location,
+    hash: &str,
+    data: &[u8],
+) -> Result<UploadResult, Error> {
+    let key: String = location.cas_key(hash, HashAlgorithm::Xxh128);
+
+    // Check if already exists (HEAD request)
+    if storage.head_object(&location.bucket, &key).await.is_ok() {
+        return Ok(UploadResult::Skipped);
+    }
+
+    storage.put_object(&location.bucket, &key, data).await?;
+    Ok(UploadResult::Uploaded)
+}
+```
+
+### Applying a Diff with Modified Chunked File
+
+When a consumer applies this diff to the parent snapshot:
+
+1. The diff entry **replaces** the parent's entry for that path
+2. The new `chunkhashes` point to the new chunk content in CAS
+3. Some chunk hashes may be identical to the original (unmodified chunks)
+4. CAS deduplication means those chunks aren't stored twice
+
+```
+Parent manifest:
+  large_video.mp4: chunkhashes = [A, B, C, D, E, F, G, H]
+
+Diff manifest (chunk 3 modified):
+  large_video.mp4: chunkhashes = [A, B, C, D', E, F, G, H]
+                                         ↑
+                                    Only D' is new in CAS
+
+Applied result:
+  large_video.mp4: chunkhashes = [A, B, C, D', E, F, G, H]
+```
+
+### DiffManifestExporter Remaining Methods
+
+```rust
+impl DiffManifestExporter for WritableVfs {
+    // export_diff_manifest() defined above
 
     fn clear_dirty(&self) -> Result<(), VfsError> {
         self.dirty_manager.dirty_files.write().unwrap().clear();
@@ -1436,73 +1792,258 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Large Files (>256MB) in COW Cache
 
-V2 manifests support chunked files where files larger than 256MB are split into multiple chunks, each with its own hash. The COW cache handles these differently from the read-only memory pool:
+V2 manifests support chunked files where files larger than 256MB are split into multiple chunks, each with its own hash. The COW cache handles these with sparse chunk tracking to avoid fetching the entire file on first write.
 
 ### Read Path (Memory Pool) vs Write Path (COW)
 
 | Aspect | Read Path (MemoryPool) | Write Path (DirtyFile) |
 |--------|------------------------|------------------------|
-| Storage unit | 256MB chunks | Whole file |
-| Memory layout | Separate blocks per chunk | Single contiguous `Vec<u8>` |
-| Disk layout | CAS by chunk hash | Materialized by path |
-| Large file handling | Multiple blocks | Single large allocation |
+| Storage unit | 256MB chunks | Sparse chunks + dirty ranges |
+| Memory layout | Separate blocks per chunk | On-demand chunk loading |
+| Disk layout | CAS by chunk hash | Materialized by path (assembled on flush) |
+| Large file handling | Fetch only accessed chunks | Fetch only modified chunks |
 
-### Why COW Uses Whole Files
+### Sparse COW Design
 
-1. **Write semantics**: Applications expect `write()` at any offset to work. Chunk boundaries are invisible to the application.
-
-2. **Simplicity**: Tracking dirty ranges across chunk boundaries adds complexity. Whole-file COW is simpler and correct.
-
-3. **Diff manifest**: On export, we hash the entire modified file anyway. Keeping it whole avoids reassembly.
-
-### Large File COW Flow
-
-```
-write(ino, offset=500MB, data) on a 1GB file:
-│
-├─ DirtyFileManager::cow_copy(ino)
-│  │
-│  ├─ File not dirty → fetch all chunks from read store
-│  │  ├─ FileStore::retrieve(chunk_0_hash) → 256MB
-│  │  ├─ FileStore::retrieve(chunk_1_hash) → 256MB
-│  │  ├─ FileStore::retrieve(chunk_2_hash) → 256MB
-│  │  └─ FileStore::retrieve(chunk_3_hash) → 256MB
-│  │
-│  ├─ Concatenate into single Vec<u8> (1GB)
-│  │
-│  └─ Create DirtyFile with full content
-│
-├─ DirtyFile::write(offset=500MB, data)
-│  └─ Modify in-place in Vec<u8>
-│
-└─ flush_to_disk(ino)
-   └─ WriteCache::write_file("path/to/file", full_1GB_data)
-      └─ Write entire file to: cache_dir/path/to/file
-```
-
-### Memory Considerations
-
-For very large files, the COW approach can consume significant memory:
+Instead of fetching the entire file on first write, we track which chunks are dirty and fetch only what's needed:
 
 ```rust
-/// Configuration for large file handling.
-#[derive(Debug, Clone)]
-pub struct LargeFileConfig {
-    /// Maximum file size to COW in memory.
-    /// Files larger than this use disk-only COW.
-    pub max_memory_cow_size: u64,
+/// Content state for a dirty file.
+///
+/// Tracks original chunks and which have been modified.
+pub enum DirtyContent {
+    /// Small file (single chunk) - entire content in memory.
+    Small {
+        data: Vec<u8>,
+    },
+    /// Large file (multiple chunks) - sparse tracking.
+    Chunked {
+        /// Original chunk hashes (from manifest).
+        original_chunks: Vec<String>,
+        /// Chunk size (256MB for V2).
+        chunk_size: u64,
+        /// Total file size.
+        total_size: u64,
+        /// Loaded chunks: chunk_index → data.
+        /// Only chunks that have been read or written are loaded.
+        loaded_chunks: HashMap<u32, Vec<u8>>,
+        /// Which chunks have been modified.
+        dirty_chunks: HashSet<u32>,
+    },
 }
 
-impl Default for LargeFileConfig {
-    fn default() -> Self {
-        Self {
-            max_memory_cow_size: 4 * 1024 * 1024 * 1024, // 4GB
+impl DirtyContent {
+    /// Create sparse content for a chunked file.
+    ///
+    /// # Arguments
+    /// * `original_chunks` - Chunk hashes from manifest
+    /// * `chunk_size` - Size of each chunk (256MB)
+    /// * `total_size` - Total file size
+    pub fn chunked(original_chunks: Vec<String>, chunk_size: u64, total_size: u64) -> Self {
+        Self::Chunked {
+            original_chunks,
+            chunk_size,
+            total_size,
+            loaded_chunks: HashMap::new(),
+            dirty_chunks: HashSet::new(),
+        }
+    }
+
+    /// Check if a chunk is loaded.
+    pub fn is_chunk_loaded(&self, chunk_index: u32) -> bool {
+        match self {
+            Self::Small { .. } => true,
+            Self::Chunked { loaded_chunks, .. } => loaded_chunks.contains_key(&chunk_index),
+        }
+    }
+
+    /// Get loaded chunk data (None if not loaded).
+    pub fn get_chunk(&self, chunk_index: u32) -> Option<&[u8]> {
+        match self {
+            Self::Small { data } if chunk_index == 0 => Some(data),
+            Self::Small { .. } => None,
+            Self::Chunked { loaded_chunks, .. } => {
+                loaded_chunks.get(&chunk_index).map(|v| v.as_slice())
+            }
+        }
+    }
+
+    /// Insert a loaded chunk.
+    pub fn insert_chunk(&mut self, chunk_index: u32, data: Vec<u8>) {
+        if let Self::Chunked { loaded_chunks, .. } = self {
+            loaded_chunks.insert(chunk_index, data);
+        }
+    }
+
+    /// Mark a chunk as dirty.
+    pub fn mark_dirty(&mut self, chunk_index: u32) {
+        if let Self::Chunked { dirty_chunks, .. } = self {
+            dirty_chunks.insert(chunk_index);
         }
     }
 }
 ```
 
-For files exceeding `max_memory_cow_size`, an alternative disk-based COW could be implemented (future work).
+### Sparse COW Flow
+
+```
+App opens 2GB file (8 × 256MB chunks)
+│
+├─ open() → No data fetched yet
+│
+├─ seek(768MB) + read(256MB)  [chunk 3]
+│  │
+│  └─ File not dirty → delegate to MemoryPool
+│     └─ Fetch chunk 3 only from S3
+│
+├─ seek(1024MB) + write(100KB)  [chunk 4]
+│  │
+│  ├─ DirtyFileManager::write(ino, offset=1024MB, data)
+│  │  │
+│  │  ├─ is_dirty(ino)? → NO
+│  │  │  │
+│  │  │  └─ cow_copy_sparse(ino)
+│  │  │     ├─ Get file metadata from INodeManager
+│  │  │     ├─ Create DirtyFile with DirtyContent::Chunked {
+│  │  │     │     original_chunks: [h0, h1, h2, h3, h4, h5, h6, h7],
+│  │  │     │     loaded_chunks: {},  // Empty - nothing loaded yet
+│  │  │     │     dirty_chunks: {},
+│  │  │     │  }
+│  │  │     └─ NO S3 FETCH - just metadata
+│  │  │
+│  │  ├─ Determine affected chunk: offset 1024MB → chunk_index = 4
+│  │  │
+│  │  ├─ Chunk 4 not loaded → fetch_chunk(4)
+│  │  │  └─ FileStore::retrieve(h4) → 256MB
+│  │  │
+│  │  ├─ loaded_chunks.insert(4, chunk_data)
+│  │  │
+│  │  ├─ Apply write to chunk 4 at local offset
+│  │  │
+│  │  └─ dirty_chunks.insert(4)
+│  │
+│  └─ Only chunk 4 fetched (256MB), not entire file (2GB)
+│
+└─ close() / fsync()
+   │
+   └─ flush_to_disk(ino)
+      ├─ For each dirty chunk:
+      │  └─ Assemble and write to materialized cache
+      └─ Write full file: cache_dir/path/to/file (2GB)
+         ├─ Chunks 0-3: fetch from S3 (not in loaded_chunks)
+         ├─ Chunk 4: use dirty data from loaded_chunks
+         └─ Chunks 5-7: fetch from S3
+```
+
+### Optimized Flush: Incremental Assembly
+
+For very large files, we can optimize the flush to avoid loading all chunks into memory at once:
+
+```rust
+impl DirtyFileManager {
+    /// Flush a chunked dirty file to disk incrementally.
+    ///
+    /// # Arguments
+    /// * `inode_id` - Inode ID of file to flush
+    /// * `dirty` - The dirty file state
+    async fn flush_chunked_to_disk(
+        &self,
+        inode_id: INodeId,
+        dirty: &DirtyFile,
+    ) -> Result<(), VfsError> {
+        let (rel_path, content) = (dirty.rel_path(), &dirty.content);
+
+        let DirtyContent::Chunked {
+            original_chunks,
+            chunk_size,
+            total_size,
+            loaded_chunks,
+            dirty_chunks,
+        } = content else {
+            // Small file - use simple flush
+            return self.flush_small_to_disk(inode_id, dirty).await;
+        };
+
+        // Create output file
+        let full_path: PathBuf = self.cache.cache_dir().join(rel_path);
+        if let Some(parent) = full_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let mut file: std::fs::File = std::fs::File::create(&full_path)?;
+
+        // Write chunks sequentially
+        for (chunk_idx, chunk_hash) in original_chunks.iter().enumerate() {
+            let chunk_idx: u32 = chunk_idx as u32;
+
+            let chunk_data: Vec<u8> = if let Some(data) = loaded_chunks.get(&chunk_idx) {
+                // Use loaded (possibly dirty) chunk
+                data.clone()
+            } else {
+                // Fetch unmodified chunk from S3
+                self.read_store.retrieve(chunk_hash, HashAlgorithm::Xxh128).await?
+            };
+
+            file.write_all(&chunk_data)?;
+        }
+
+        file.sync_all()?;
+
+        Ok(())
+    }
+}
+```
+
+### Memory Efficiency Comparison
+
+| Scenario | Old Design (Full COW) | New Design (Sparse COW) |
+|----------|----------------------|-------------------------|
+| Open 2GB file | 0 bytes | 0 bytes |
+| Read chunk 3 | 0 bytes (via MemoryPool) | 0 bytes (via MemoryPool) |
+| Write to chunk 4 | **2GB fetched** | **256MB fetched** |
+| Flush to disk | 2GB in memory | Stream chunks (256MB peak) |
+
+### When Full COW is Still Used
+
+Small files (< 256MB, single chunk) still use the simple `DirtyContent::Small` variant with full in-memory data, as the overhead of sparse tracking isn't worth it.
+
+```rust
+impl DirtyFile {
+    /// Create dirty file with appropriate content type.
+    pub fn from_cow(
+        inode_id: INodeId,
+        rel_path: String,
+        file_content: &FileContent,
+        total_size: u64,
+        executable: bool,
+    ) -> Self {
+        let content: DirtyContent = match file_content {
+            FileContent::SingleHash(_) => {
+                // Small file - will load full content on first access
+                DirtyContent::Small { data: Vec::new() }
+            }
+            FileContent::Chunked(hashes) => {
+                // Large file - sparse tracking
+                DirtyContent::chunked(
+                    hashes.clone(),
+                    CHUNK_SIZE_V2,
+                    total_size,
+                )
+            }
+        };
+
+        Self {
+            inode_id,
+            rel_path,
+            content,
+            original_hash: None, // Set later for small files
+            state: DirtyState::Modified,
+            mtime: SystemTime::now(),
+            executable,
+        }
+    }
+}
+```
 
 ---
 
