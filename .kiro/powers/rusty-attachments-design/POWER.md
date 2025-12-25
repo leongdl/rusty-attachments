@@ -1,3 +1,20 @@
+---
+name: rusty-attachments-design
+version: 1.0.0
+description: Design documentation reference for rusty-attachments project
+keywords:
+  - rusty-attachments
+  - design
+  - manifest
+  - storage
+  - upload
+  - download
+  - s3
+  - cas
+  - deadline
+  - job-attachments
+---
+
 # Rusty Attachments Design Reference
 
 This power provides quick access to design documentation for the rusty-attachments project - a Rust implementation of AWS Deadline Cloud job attachments.
