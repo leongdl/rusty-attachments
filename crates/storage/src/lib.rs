@@ -45,6 +45,7 @@ mod data_cache;
 mod download;
 mod error;
 pub mod hash_cache;
+pub mod hash_upload;
 pub mod manifest_storage;
 pub mod s3_check_cache;
 mod traits;
@@ -55,7 +56,7 @@ pub use cas::{
     expected_chunk_count, generate_chunks, needs_chunking, upload_strategy, ChunkInfo,
     DownloadStrategy, UploadStrategy,
 };
-pub use data_cache::{FileSystemDataCache, S3DataCache};
+pub use data_cache::{FileSystemDataCache, OwnedS3DataCache, S3DataCache};
 pub use download::{
     generate_unique_copy_path, set_file_executable, set_file_mtime, verify_file_size,
     DownloadOptions, DownloadOrchestrator, DEFAULT_DOWNLOAD_CONCURRENCY,
@@ -98,4 +99,11 @@ pub use types::{
 pub use upload::{
     UploadOptions, UploadOrchestrator, DEFAULT_UPLOAD_CONCURRENCY,
     SMALL_FILE_THRESHOLD as UPLOAD_SMALL_FILE_THRESHOLD,
+};
+
+// Pipelined hash+upload
+pub use hash_upload::{
+    hash_upload_abs_manifest, hash_upload_abs_manifest_staged, HashUploadOptions,
+    HashUploadProgress, HashUploadResult, ProcessedItem, ProgressTracker, StagedPipeline,
+    StagedPipelineConfig, StagedProcessedItem, WorkItem,
 };

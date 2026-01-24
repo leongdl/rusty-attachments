@@ -3,6 +3,7 @@
 //! Provides S3 and filesystem backends for the `ContentAddressedDataCache` trait.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use rusty_attachments_model::HashAlgorithm;
@@ -124,6 +125,154 @@ impl<C: StorageClient> ContentAddressedDataCache for S3DataCache<'_, C> {
 
         // Update cache
         if let Some(cache) = self.s3_check_cache {
+            cache.mark_uploaded(&self.bucket, &key).await;
+        }
+
+        Ok(())
+    }
+
+    async fn get_object(
+        &self,
+        hash: &str,
+        algorithm: HashAlgorithm,
+    ) -> Result<Vec<u8>, StorageError> {
+        let key: String = self.get_object_key(hash, algorithm);
+        self.client.get_object(&self.bucket, &key).await
+    }
+
+    async fn get_object_to_file(
+        &self,
+        hash: &str,
+        algorithm: HashAlgorithm,
+        file_path: &Path,
+        progress: Option<&dyn ProgressCallback>,
+    ) -> Result<(), StorageError> {
+        let key: String = self.get_object_key(hash, algorithm);
+        let file_path_str: &str = file_path.to_str().ok_or_else(|| StorageError::IoError {
+            path: file_path.display().to_string(),
+            message: "Path contains invalid UTF-8".to_string(),
+        })?;
+
+        self.client
+            .get_object_to_file(&self.bucket, &key, file_path_str, progress)
+            .await
+    }
+}
+
+/// Owned S3-backed content-addressable data cache.
+///
+/// Unlike `S3DataCache`, this version owns the client via `Arc`, making it `'static`.
+/// Use this when you need to pass the cache to functions requiring `'static` lifetime.
+pub struct OwnedS3DataCache<C: StorageClient> {
+    client: Arc<C>,
+    bucket: String,
+    key_prefix: String,
+    s3_check_cache: Option<Arc<S3CheckCache>>,
+}
+
+impl<C: StorageClient> OwnedS3DataCache<C> {
+    /// Create a new owned S3 data cache.
+    ///
+    /// # Arguments
+    /// * `client` - S3 storage client (wrapped in Arc)
+    /// * `bucket` - S3 bucket name
+    /// * `key_prefix` - Prefix for all keys (e.g., "Data")
+    pub fn new(client: Arc<C>, bucket: impl Into<String>, key_prefix: impl Into<String>) -> Self {
+        Self {
+            client,
+            bucket: bucket.into(),
+            key_prefix: key_prefix.into(),
+            s3_check_cache: None,
+        }
+    }
+
+    /// Add an S3 check cache for existence lookups.
+    pub fn with_check_cache(mut self, cache: Arc<S3CheckCache>) -> Self {
+        self.s3_check_cache = Some(cache);
+        self
+    }
+}
+
+#[async_trait]
+impl<C: StorageClient + 'static> ContentAddressedDataCache for OwnedS3DataCache<C> {
+    fn get_object_key(&self, hash: &str, algorithm: HashAlgorithm) -> String {
+        format!("{}/{}.{}", self.key_prefix, hash, algorithm.extension())
+    }
+
+    async fn object_exists(
+        &self,
+        hash: &str,
+        algorithm: HashAlgorithm,
+    ) -> Result<bool, StorageError> {
+        let key: String = self.get_object_key(hash, algorithm);
+
+        // Check local cache first
+        if let Some(cache) = &self.s3_check_cache {
+            if cache.exists(&self.bucket, &key).await {
+                return Ok(true);
+            }
+        }
+
+        // Check S3
+        let exists: bool = self.client.head_object(&self.bucket, &key).await?.is_some();
+
+        // Update cache if exists
+        if exists {
+            if let Some(cache) = &self.s3_check_cache {
+                cache.mark_uploaded(&self.bucket, &key).await;
+            }
+        }
+
+        Ok(exists)
+    }
+
+    async fn object_size(
+        &self,
+        hash: &str,
+        algorithm: HashAlgorithm,
+    ) -> Result<Option<u64>, StorageError> {
+        let key: String = self.get_object_key(hash, algorithm);
+        self.client.head_object(&self.bucket, &key).await
+    }
+
+    async fn put_object(
+        &self,
+        hash: &str,
+        algorithm: HashAlgorithm,
+        data: &[u8],
+    ) -> Result<(), StorageError> {
+        let key: String = self.get_object_key(hash, algorithm);
+        self.client
+            .put_object(&self.bucket, &key, data, None, None)
+            .await?;
+
+        // Update cache
+        if let Some(cache) = &self.s3_check_cache {
+            cache.mark_uploaded(&self.bucket, &key).await;
+        }
+
+        Ok(())
+    }
+
+    async fn put_object_from_file(
+        &self,
+        hash: &str,
+        algorithm: HashAlgorithm,
+        file_path: &Path,
+        progress: Option<&dyn ProgressCallback>,
+    ) -> Result<(), StorageError> {
+        let key: String = self.get_object_key(hash, algorithm);
+        let file_path_str: &str = file_path.to_str().ok_or_else(|| StorageError::IoError {
+            path: file_path.display().to_string(),
+            message: "Path contains invalid UTF-8".to_string(),
+        })?;
+
+        self.client
+            .put_object_from_file(&self.bucket, &key, file_path_str, None, None, progress)
+            .await?;
+
+        // Update cache
+        if let Some(cache) = &self.s3_check_cache {
             cache.mark_uploaded(&self.bucket, &key).await;
         }
 
