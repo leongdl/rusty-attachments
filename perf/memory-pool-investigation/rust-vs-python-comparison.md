@@ -5,97 +5,133 @@
 
 ## Executive Summary
 
-Using identical test configurations (5.3 GB VFX dataset, 1 GB memory pool, 10 workers), Rust delivers 1.8x higher throughput (164 MB/s vs 298 MB/s) while using 7x less peak memory (199 MB vs 1402 MB). Python's memory pool correctly tracks allocations but actual RSS exceeds the 1 GB limit by 37% due to boto3's internal BytesIO wrapping during HTTP uploads. Rust's AWS CRT streaming approach keeps RSS well under the pool limit (19% of limit), making memory usage predictable and controllable.
+Using identical test configurations (5.3 GB VFX dataset, 1 GB memory pool, 10 workers), **Rust with Transfer Manager is 1.5x faster than Python (451 vs 298 MB/s) while using 3.6x less memory (384 vs 1402 MB)**. Without Transfer Manager, Rust standard client is slower (164 MB/s) but uses 7x less memory. Python exceeds its 1 GB memory limit by 37% due to boto3's BytesIO wrapping, while Rust stays well under the limit. The Transfer Manager provides automatic multipart uploads that dramatically improve throughput.
 
 ---
 
-## Test Configuration (Identical for Both)
+## Test Configuration (Identical for All Tests)
 
 | Parameter | Value |
 |-----------|-------|
 | Dataset | VFX workload: 260 files, 5.32 GB |
 | Memory pool limit | 1 GB |
-| Max workers | 10 |
 | S3 bucket | adeadlineja |
 | Hash algorithm | XXH128 |
 
 ---
 
-## Results
+## Complete Results
 
-### Rust (Real S3 Upload)
+### All Benchmark Runs
+
+| Config | Concurrency | Time | Throughput | Peak RSS | RSS/Pool |
+|--------|-------------|------|------------|----------|----------|
+| **Python baseline** | 10 | 17.85s | 298 MB/s | 1402 MB | 1.37x ✗ |
+| Rust standard | 10 | 32.47s | 164 MB/s | 199 MB | 0.19x ✓ |
+| Rust standard | 20 | 32.02s | 166 MB/s | 293 MB | 0.29x ✓ |
+| Rust standard | 30 | 35.35s | 151 MB/s | 355 MB | 0.35x ✓ |
+| **Rust TM** | 10 | 11.81s | 451 MB/s | 384 MB | 0.38x ✓ |
+| Rust TM | 20 | 12.14s | 439 MB/s | 338 MB | 0.33x ✓ |
+| Rust TM | 30 | 12.40s | 429 MB/s | 435 MB | 0.43x ✓ |
+
+*TM = Transfer Manager (automatic multipart uploads)*
+
+---
+
+## Performance Trade-off Analysis
+
+### Throughput vs Concurrency
 
 ```
-Total time:      32.47s
-Peak RSS:        199 MB
-Throughput:      163.97 MB/s
-Files processed: 260
-RSS/Pool ratio:  0.19x (well under limit ✓)
+Throughput (MB/s)
+500 |                    ★ Rust TM (451)
+450 |                    ●───●───● Rust TM (439-429)
+400 |
+350 |
+300 |  ◆ Python (298)
+250 |
+200 |
+150 |  ○───○───○ Rust Std (164-151)
+    +----+----+----+----+----+----
+        10   15   20   25   30   Concurrency
 ```
 
-### Python (Real S3 Upload via deadline-cloud)
+### Memory vs Concurrency
 
 ```
-Total time:      17.85s
-Peak RSS:        1402 MB
-Throughput:      298.29 MB/s
-Files processed: 260
-RSS/Pool ratio:  1.37x (37% over limit ✗)
+Peak RSS (MB)
+1500 |  ◆ Python (1402) - EXCEEDS 1GB LIMIT
+1400 |
+1000 |  ─────────────────────── 1 GB Limit ───
+ 500 |                    ● Rust TM (384-435)
+ 400 |              ○ Rust Std (293-355)
+ 200 |  ○ Rust Std (199)
+     +----+----+----+----+----+----
+         10   15   20   25   30   Concurrency
 ```
 
 ---
 
-## Comparison Table
+## Key Findings
 
-| Metric | Rust | Python | Winner |
-|--------|------|--------|--------|
-| Total time | 32.47s | 17.85s | Python (1.8x) |
-| Throughput | 164 MB/s | 298 MB/s | Python (1.8x) |
-| Peak RSS | 199 MB | 1402 MB | **Rust (7x less)** |
-| RSS/Pool ratio | 0.19x | 1.37x | **Rust** |
-| Memory exceeded? | No | Yes (+37%) | **Rust** |
-| Memory predictable? | Yes | No | **Rust** |
+### 1. Transfer Manager is the Game Changer
 
----
+| Metric | Rust Standard | Rust TM | Improvement |
+|--------|---------------|---------|-------------|
+| Throughput | 164 MB/s | 451 MB/s | **2.75x faster** |
+| Time | 32.47s | 11.81s | **2.75x faster** |
 
-## Analysis
+The Transfer Manager automatically uses multipart uploads for large files, parallelizing parts within each file. This is why it's so much faster.
 
-### Why Python is Faster (Throughput)
+### 2. Concurrency Scaling
 
-Python achieved higher throughput in this test because:
+**Rust Standard Client:**
+- 10 → 20 concurrency: No improvement (164 → 166 MB/s)
+- 20 → 30 concurrency: Slight degradation (166 → 151 MB/s)
+- Bottleneck: Single-part uploads, not concurrency
 
-1. **Aggressive pipelining**: Python's pipeline aggressively reads ahead, keeping more data in flight
-2. **Memory trade-off**: By exceeding the memory limit, Python can buffer more data for upload
-3. **boto3 connection pooling**: Mature HTTP connection reuse
+**Rust Transfer Manager:**
+- 10 → 20 concurrency: Slight degradation (451 → 439 MB/s)
+- 20 → 30 concurrency: Slight degradation (439 → 429 MB/s)
+- Already saturating network at 10 concurrency
 
-### Why Rust Uses Less Memory
+**Conclusion:** More concurrency doesn't help. The Transfer Manager at 10 concurrency is optimal.
 
-Rust's memory efficiency comes from:
+### 3. Memory Efficiency
 
-1. **AWS CRT streaming**: Data streams directly to S3 without full-file buffering
-2. **Deterministic memory**: Memory freed immediately when data is dropped
-3. **No BytesIO wrapping**: AWS CRT doesn't wrap data for retry support like boto3
-4. **Backpressure**: Pipeline respects memory limits strictly
+| Config | Peak RSS | vs 1GB Limit |
+|--------|----------|--------------|
+| Python | 1402 MB | **+37% over** |
+| Rust Std (10) | 199 MB | 19% of limit |
+| Rust TM (10) | 384 MB | 38% of limit |
 
-### The Memory Trade-off
+Rust stays well under the memory limit. Python exceeds it by 37%.
 
-Python's higher throughput comes at a cost:
+### 4. Best Configurations Compared
 
-- **Unpredictable memory**: RSS can exceed pool limit by 37%+ 
-- **Risk of OOM**: On memory-constrained systems, this can cause failures
-- **No real limit**: The "1 GB limit" is actually ~1.4 GB in practice
-
-Rust's approach:
-
-- **Predictable memory**: RSS stays well under the configured limit
-- **Safe on constrained systems**: Memory limit is actually enforced
-- **Controllable**: You get what you configure
+| Metric | Python (10 workers) | Rust TM (10 conc) | Winner |
+|--------|---------------------|-------------------|--------|
+| Throughput | 298 MB/s | 451 MB/s | **Rust 1.5x** |
+| Time | 17.85s | 11.81s | **Rust 1.5x** |
+| Peak RSS | 1402 MB | 384 MB | **Rust 3.6x less** |
+| Memory predictable | No (+37%) | Yes (38%) | **Rust** |
 
 ---
 
-## Memory Behavior Deep Dive
+## Why Transfer Manager is Faster
 
-### Python Memory Gap Explained
+The AWS S3 Transfer Manager provides:
+
+1. **Automatic multipart uploads**: Large files are split into parts uploaded in parallel
+2. **Optimized part sizing**: Automatically determines optimal part size
+3. **Connection pooling**: Efficient HTTP connection reuse
+4. **Reduced overhead**: Fewer SigV4 signing operations per byte
+
+For a 5.3 GB dataset with large files (VFX workload), multipart uploads provide massive speedup because multiple parts of the same file upload simultaneously.
+
+---
+
+## Why Python Exceeds Memory Limit
 
 When Python's pool shows 1024 MB limit but RSS is 1402 MB:
 
@@ -103,53 +139,41 @@ When Python's pool shows 1024 MB limit but RSS is 1402 MB:
 |--------|----------|
 | boto3 BytesIO wrapping | +200-300 MB |
 | Python allocator fragmentation | +50-100 MB |
-| Thread overhead (20 threads) | +60 MB |
+| Thread overhead | +60 MB |
 | **Total gap** | **~378 MB (37%)** |
 
-### Rust Memory Efficiency
-
-Rust's 199 MB peak for 5.32 GB upload:
-
-- Streaming uploads (no full-file buffering)
-- Immediate memory release on drop
-- Efficient async task scheduling
-- Only ~19% of the 1 GB limit used
+boto3 wraps upload data in BytesIO for retry support, effectively doubling memory for in-flight data.
 
 ---
 
 ## Recommendations
 
-### For Memory-Constrained Environments
-
-**Python:**
-- Set pool limit to **60-70% of available memory** (account for 1.4x multiplier)
-- Monitor actual RSS, not just pool allocation
-- Risk of OOM if limit set too high
-
-**Rust:**
-- Pool limit can be set to **80-90% of available memory**
-- RSS will stay well under the configured limit
-- Safe and predictable
-
 ### For Maximum Throughput
+Use **Rust with Transfer Manager at 10 concurrency**:
+- 1.5x faster than Python
+- 3.6x less memory
+- Predictable memory usage
 
-**Python:**
-- Higher throughput when memory is not constrained
-- Good choice when memory is plentiful
+### For Memory-Constrained Systems
+Use **Rust** (either client):
+- Memory stays under configured limit
+- Python will exceed limit by ~40%
 
-**Rust:**
-- Slightly lower throughput but predictable behavior
-- Better choice when memory is limited or predictability matters
+### When to Use Python
+- When memory is plentiful and you need deadline-cloud compatibility
+- Set pool limit to 60-70% of available memory to account for overhead
 
 ---
 
 ## Conclusion
 
-| Aspect | Rust | Python |
-|--------|------|--------|
-| Throughput | 164 MB/s | 298 MB/s |
-| Memory efficiency | **7x better** | - |
-| Memory predictability | **Yes** | No |
-| Safe for constrained systems | **Yes** | Risk of OOM |
+| Aspect | Python | Rust Standard | Rust TM |
+|--------|--------|---------------|---------|
+| Throughput | 298 MB/s | 164 MB/s | **451 MB/s** |
+| vs Python | baseline | 0.55x | **1.5x faster** |
+| Peak RSS | 1402 MB | 199 MB | 384 MB |
+| Memory efficiency | - | **7x better** | **3.6x better** |
+| Memory predictable | No | Yes | Yes |
+| Recommended | ✗ | For low memory | **✓ Best overall** |
 
-**Bottom line:** Python is faster but uses unpredictable memory. Rust is more memory-efficient and predictable. Choose based on your constraints.
+**Bottom line:** Rust with Transfer Manager provides the best of both worlds - 1.5x faster than Python with 3.6x less memory and predictable behavior.
