@@ -118,16 +118,45 @@ Rust stays well under the memory limit. Python exceeds it by 37%.
 
 ---
 
-## Why Transfer Manager is Faster
+## Why Rust Standard Client is Slower than Python
 
-The AWS S3 Transfer Manager provides:
+**Root cause:** Python manually implements multipart uploads, Rust standard client does not.
 
-1. **Automatic multipart uploads**: Large files are split into parts uploaded in parallel
-2. **Optimized part sizing**: Automatically determines optimal part size
-3. **Connection pooling**: Efficient HTTP connection reuse
-4. **Reduced overhead**: Fewer SigV4 signing operations per byte
+**Python's approach** (in `_hash_upload_abs_manifest_s3_pipeline.py`):
+```python
+multipart_threshold = 2 * multipart_part_size  # 64MB threshold
+if file_size > multipart_threshold:
+    # Split into 32MB parts, upload in parallel
+    self._stream_hash_and_submit_multipart(item)
+```
 
-For a 5.3 GB dataset with large files (VFX workload), multipart uploads provide massive speedup because multiple parts of the same file upload simultaneously.
+**Rust standard client:**
+- Uses simple `put_object()` for ALL files
+- No multipart - uploads entire file in one HTTP request
+- Large files (100MB+) are slow because one HTTP request = one file
+
+**Rust Transfer Manager:**
+- Uses `aws_sdk_s3_transfer_manager` which automatically does multipart
+- Splits large files into parts and uploads in parallel
+- That's why it's 2.75x faster than standard client
+
+## How to Make Rust Match Python (Without Transfer Manager)
+
+**Option 1: Always use Transfer Manager** (recommended)
+- Already implemented, use `--transfer-manager` flag
+- 451 MB/s vs Python's 298 MB/s - actually faster!
+
+**Option 2: Implement manual multipart in CrtStorageClient**
+- Add multipart upload logic similar to Python
+- Threshold: 64MB (2 × 32MB part size)
+- Part size: 32MB
+- More code complexity, same result as Transfer Manager
+
+**Option 3: Make Transfer Manager the default**
+- Change library to use Transfer Manager by default
+- Standard client only for testing/compatibility
+
+**Recommendation:** Use Transfer Manager. It's already faster than Python and requires no additional code.
 
 ---
 
@@ -174,6 +203,9 @@ Use **Rust** (either client):
 | Peak RSS | 1402 MB | 199 MB | 384 MB |
 | Memory efficiency | - | **7x better** | **3.6x better** |
 | Memory predictable | No | Yes | Yes |
+| Multipart uploads | Manual | **No** | Automatic |
 | Recommended | ✗ | For low memory | **✓ Best overall** |
 
-**Bottom line:** Rust with Transfer Manager provides the best of both worlds - 1.5x faster than Python with 3.6x less memory and predictable behavior.
+**Why Rust standard is slower:** It doesn't do multipart uploads. Python manually implements multipart for files >64MB. Rust Transfer Manager does this automatically.
+
+**Bottom line:** Use Rust with Transfer Manager. It's 1.5x faster than Python with 3.6x less memory. The standard client is only slower because it lacks multipart - not a fundamental limitation.
