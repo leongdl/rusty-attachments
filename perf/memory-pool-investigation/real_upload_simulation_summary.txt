@@ -1,0 +1,17 @@
+Real Upload Simulation Summary
+================================================================================
+
+Configuration:
+  Files: 20
+  File size: 50 MB
+  Pool limit: 500 MB
+  Workers: 4 + 4
+
+Results:
+  Max pool: 400.00 MB
+  Max RSS: 1012.22 MB
+  Max gap: 1012.22 MB
+  Violations: 11
+
+Memory exceeded pool limit by 102.4%
+This proves the pool tracks correctly but RSS exceeds due to boto3 refs.

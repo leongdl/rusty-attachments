@@ -1,0 +1,74 @@
+PID: 120963
+Python: 3.9.25 (main, Dec 10 2025, 00:00:00) 
+[GCC 11.5.0 20240719 (Red Hat 11.5.0-5)]
+
+================================================================================
+SIMULATING REAL UPLOAD BEHAVIOR
+================================================================================
+Configuration:
+  Files: 20
+  File size: 50 MB
+  Pool limit: 500 MB
+  Workers: 4 (hash) + 4 (upload)
+  PID: 120963
+================================================================================
+
+Submitting 20 files...
+Waiting for hashing to complete...
+Hashing complete. Waiting for uploads...
+Uploads complete!
+Clearing boto3 references...
+
+Trace saved to: /tmp/real_upload_simulation_trace.jsonl
+
+================================================================================
+RESULTS
+================================================================================
+Pool limit: 500 MB
+Max pool allocated: 400.00 MB
+Max RSS: 1012.22 MB
+Max gap: 1012.22 MB
+
+Stats:
+  Files hashed: 20
+  Files uploaded: 20
+  boto3 refs held: 0 (should be 0 after cleanup)
+
+✓ Pool stayed within limit
+
+⚠️  RSS EXCEEDED POOL LIMIT 11 times!
+   First violation at 451ms: 549.71 MB
+   Peak: 1012.22 MB
+   Exceeded by: 512.22 MB (102.4%)
+
+   PROOF: Pool tracked 400.00 MB, but RSS was 1012.22 MB
+   Gap: 1012.22 MB unaccounted for!
+
+Summary saved to: /tmp/real_upload_simulation_summary.txt
+
+================================================================================
+SAMPLE TRACE DATA (first 10 and last 10 samples)
+================================================================================
+Time(ms)   Pool(MB)     RSS(MB)      Gap(MB)     
+--------------------------------------------------------------------------------
+0          0.00         11.93        11.93       
+50         200.00       68.63        -131.37     
+100        200.00       130.50       -69.50      
+150        200.00       192.12       -7.88       
+200        400.00       247.04       -152.96     
+250        200.00       308.65       108.65      
+301        200.00       370.53       170.53      
+351        400.00       425.70       25.70       
+401        200.00       487.83       287.83      
+451        200.00       549.71       349.71      
+...        ...          ...          ...         
+551        400.00       666.75       266.75      
+601        200.00       728.11       528.11      
+651        200.00       789.99       589.99      
+701        400.00       844.90       444.90      
+752        200.00       907.04       707.04      
+802        200.00       968.91       768.91      
+852        200.00       1012.19      812.19      
+902        0.00         1012.22      1012.22     
+952        0.00         1012.22      1012.22     
+1173       0.00         12.46        12.46       

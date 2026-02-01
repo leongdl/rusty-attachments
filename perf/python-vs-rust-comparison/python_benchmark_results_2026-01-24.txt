@@ -1,0 +1,92 @@
+Python S3 Hash+Upload Benchmark
+======================================================================
+Test dir:  /tmp/bench_vfx
+S3 dest:   s3://adeadlineja/python/bench/
+Runs:      3
+
+Verifying test data...
+  Found 260 files (5583.26 MB)
+
+======================================================================
+Run 1/3
+======================================================================
+
+Clearing caches...
+  Already clean: /home/ssm-user/.deadline/cache
+  Already clean: /home/ssm-user/.deadline/job_attachments
+
+Clearing S3 prefix...
+  Deleted 0 objects from s3://adeadlineja/python/bench/run1/
+
+Running benchmark...
+  Uploading to s3://adeadlineja/python/bench/run1/...
+
+=== Run 1 Results ===
+Total time:    17.21s
+Throughput:    324.41 MB/s
+Peak memory:   5370 MB
+Files hashed:  268
+Files uploaded: 268
+Total size:    5583.26 MB
+
+======================================================================
+Run 2/3
+======================================================================
+
+Clearing caches...
+  Already clean: /home/ssm-user/.deadline/cache
+  Already clean: /home/ssm-user/.deadline/job_attachments
+
+Clearing S3 prefix...
+  Deleted 0 objects from s3://adeadlineja/python/bench/run2/
+
+Running benchmark...
+  Uploading to s3://adeadlineja/python/bench/run2/...
+
+=== Run 2 Results ===
+Total time:    17.23s
+Throughput:    323.99 MB/s
+Peak memory:   5285 MB
+Files hashed:  268
+Files uploaded: 268
+Total size:    5583.26 MB
+
+======================================================================
+Run 3/3
+======================================================================
+
+Clearing caches...
+  Already clean: /home/ssm-user/.deadline/cache
+  Already clean: /home/ssm-user/.deadline/job_attachments
+
+Clearing S3 prefix...
+  Deleted 0 objects from s3://adeadlineja/python/bench/run3/
+
+Running benchmark...
+  Uploading to s3://adeadlineja/python/bench/run3/...
+
+=== Run 3 Results ===
+Total time:    17.32s
+Throughput:    322.37 MB/s
+Peak memory:   4846 MB
+Files hashed:  268
+Files uploaded: 268
+Total size:    5583.26 MB
+
+======================================================================
+SUMMARY
+======================================================================
+
+| Metric | Run 1 | Run 2 | Run 3 | Average |
+|--------|-------|-------|-------|---------|
+| Total Time | 17.21s | 17.23s | 17.32s | **17.25s** |
+| Throughput | 324.4 MB/s | 324.0 MB/s | 322.4 MB/s | **323.6 MB/s** |
+| Peak Memory | 5370 MB | 5285 MB | 4846 MB | **5167 MB** |
+
+## Comparison with Rust
+
+| Metric | Python | Rust | Ratio (Python/Rust) |
+|--------|--------|------|---------------------|
+| Total Time | 17.25s | 32.6s | 0.53x |
+| Throughput | 323.6 MB/s | 163.3 MB/s | 1.98x |
+| Peak Memory | 5167 MB | 210 MB | 24.60x |

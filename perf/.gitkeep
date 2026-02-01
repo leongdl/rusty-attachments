@@ -1,0 +1,9 @@
+# Profiling artifacts directory
+# 
+# This directory stores performance profiling results:
+# - baseline-flamegraph.svg    CPU flamegraph before refactoring
+# - pipelined-flamegraph.svg   CPU flamegraph after refactoring
+# - comparison-report.md       Written analysis comparing implementations
+# - optimization-notes.md      Ideas for further optimization
+#
+# Generated files are gitignored except this placeholder.
